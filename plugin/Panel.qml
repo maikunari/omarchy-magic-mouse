@@ -136,6 +136,11 @@ Panel {
       Text { id: labelText; text: row.label; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.body; anchors.left: parent.left }
       Text { text: row.valueText; color: root.dim; font.family: root.fontFam; font.pixelSize: Style.font.caption; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter }
     }
+    function snap(v) {
+      var s = Math.round((v - row.minimum) / row.step) * row.step + row.minimum
+      s = Math.max(row.minimum, Math.min(row.maximum, s))
+      return Math.round(s * 10000) / 10000
+    }
     PanelSlider {
       bar: root.bar
       width: parent.width
@@ -143,8 +148,8 @@ Panel {
       maximum: row.maximum
       step: row.step
       value: row.value
-      onMoved: function(v) { row.changed(v) }
-      onReleased: function(v) { row.changed(v) }
+      onMoved: function(v) { row.changed(row.snap(v)) }
+      onReleased: function(v) { row.changed(row.snap(v)) }
     }
   }
 
