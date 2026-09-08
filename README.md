@@ -39,10 +39,13 @@ A small daemon grabs the real mouse and re-emits a virtual one called
   Two-finger sideways swipe = previous / next workspace. One- and two-finger
   double taps are hooks you can point at any Hyprland dispatcher or command.
 
-- **Battery in the bar:** a small Omarchy shell widget shows the mouse's charge,
-  highlights when low, and opens the Bluetooth panel on click. The daemon asks
-  the mouse directly (the mouse only volunteers its level to the kernel on its
-  own schedule, so UPower alone shows 0% for a long time after connecting).
+- **Battery and settings in the bar:** a small Omarchy shell widget shows the
+  mouse's charge and highlights when low. Click it for a settings popup with
+  tracking speed, natural scrolling, scroll speed, momentum and gesture
+  switches; every control applies live. Right-click opens the Bluetooth panel.
+  The daemon asks the mouse for its charge directly (the mouse only volunteers
+  it to the kernel on its own schedule, so UPower alone shows 0% for a long
+  time after connecting).
 - **Clicks decided by the mouse:** the kernel driver's three fixed touch zones
   (left / middle / right) are turned off, so the mouse's own firmware decides
   left vs right, exactly as on macOS.
@@ -88,7 +91,11 @@ hyprctl devices | grep magic-mouse-omarchy
 
 ## Tune it
 
-Edit `~/.config/magic-mouse/config.toml`. Changes apply live, no restart.
+Click the mouse icon in the bar for the common settings. Everything else is in
+`~/.config/magic-mouse/config.toml`; changes apply live, no restart. From a
+shell, `magic-mouse-config set pointer.tracking_speed=1.0` edits the file
+without disturbing your comments, and `magic-mouse-config get` prints the
+effective config as JSON.
 
 | Feels like… | Change |
 |---|---|

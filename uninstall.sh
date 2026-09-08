@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 systemctl --user disable --now magic-mouse.service 2>/dev/null || true
-rm -f "$HOME/.config/systemd/user/magic-mouse.service" "$HOME/.local/bin/magic-mouse-daemon"
+rm -f "$HOME/.config/systemd/user/magic-mouse.service" "$HOME/.local/bin/magic-mouse-daemon" "$HOME/.local/bin/magic-mouse-config" "$HOME/.local/bin/magic-mouse-battery-query"
 systemctl --user daemon-reload
 omarchy plugin disable io.github.maikunari.magic-mouse 2>/dev/null || true
 rm -rf "$HOME/.config/omarchy/plugins/io.github.maikunari.magic-mouse"

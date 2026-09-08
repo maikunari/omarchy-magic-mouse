@@ -11,6 +11,8 @@ fi
 
 say "daemon -> ~/.local/bin/magic-mouse-daemon"
 install -Dm755 "$here/bin/magic-mouse-daemon" "$HOME/.local/bin/magic-mouse-daemon"
+install -Dm755 "$here/bin/magic-mouse-config" "$HOME/.local/bin/magic-mouse-config"
+install -Dm755 "$here/bin/magic-mouse-battery-query" "$HOME/.local/bin/magic-mouse-battery-query"
 install -Dm644 "$here/config/magic-mouse.service" "$HOME/.config/systemd/user/magic-mouse.service"
 if [ ! -f "$HOME/.config/magic-mouse/config.toml" ]; then
   install -Dm644 "$here/config/config.toml" "$HOME/.config/magic-mouse/config.toml"

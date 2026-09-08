@@ -72,6 +72,46 @@ BarWidget {
     return "discharging"
   }
 
+  // ---- settings popup
+  function injectPanel() {
+    var target = panelLoader.item
+    if (!target) return
+    if ("bar" in target) target.bar = root.bar
+    if ("settings" in target) target.settings = root.settings
+    if ("anchorItem" in target) target.anchorItem = button
+    if ("hostWidget" in target) target.hostWidget = root
+    if ("batteryText" in target) target.batteryText = root.known ? root.percent + "% · " + root.stateText : (root.connected ? "connected" : "not connected")
+  }
+  onBarChanged: injectPanel()
+  onSettingsChanged: injectPanel()
+  onKnownChanged: injectPanel()
+  onPercentChanged: injectPanel()
+  onConnectedChanged: injectPanel()
+
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+  function open() { if (panelLoader.item && panelLoader.item.openFromHotkey) panelLoader.item.openFromHotkey() }
+  function close() { if (panelLoader.item && panelLoader.item.close) panelLoader.item.close() }
+  function togglePanel() { if (panelLoader.item && panelLoader.item.toggle) panelLoader.item.toggle() }
+  readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
+  function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
+
+  Loader {
+    id: panelLoader
+    active: true
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+    onLoaded: { root.injectPanel(); Qt.callLater(root.injectPanel) }
+  }
+
+  IpcHandler {
+    target: "io.github.maikunari.magic-mouse"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.togglePanel() }
+  }
+
   visible: connected
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -84,7 +124,9 @@ BarWidget {
     active: root.low
     tooltipText: root.connected ? root.modelName + (root.known ? " battery " + root.percent + "% (" + root.stateText + ")" : " battery: waiting for the mouse to report") : ""
     onPressed: function(b) {
-      if (root.bar) root.bar.run("omarchy-shell shell toggle omarchy.bluetooth")
+      if (!root.bar) return
+      if (b === Qt.RightButton) root.bar.run("omarchy-shell shell toggle omarchy.bluetooth")
+      else root.togglePanel()
     }
   }
 }
