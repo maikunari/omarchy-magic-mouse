@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.maikunari.magic-mouse",
-  "name": "Magic Mouse",
+  "name": "Magic Mouse for Omarchy",
   "version": "1.1.0",
   "author": "Mike Sewell",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Magic Mouse",
+    "displayName": "Magic Mouse for Omarchy",
     "description": "Mouse battery in the bar; click for pointer, scroll, momentum and gesture settings",
     "category": "Input",
     "allowMultiple": false,

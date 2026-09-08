@@ -165,3 +165,8 @@ socket, and writes its status under `$XDG_RUNTIME_DIR/magic-mouse/`.
 - Bar widget settings (on its entry in `~/.config/omarchy/shell.json`):
   `"match": "MMM"` to pin it to one device by model name, `"lowAt": 20` for the
   low-battery highlight threshold.
+
+---
+
+Magic Mouse, Mac and macOS are trademarks of Apple Inc. This project is
+independent and is not affiliated with or endorsed by Apple.
