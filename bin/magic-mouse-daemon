@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""magic-mouse-daemon: Mac-like Apple Magic Mouse for Wayland (made for Omarchy).
+
+Grabs the Magic Mouse's evdev node (kernel hid_magicmouse driver) and re-emits
+a virtual mouse called "magic-mouse-omarchy" with:
+
+  pointer   acceleration computed here from a smoothed velocity, so Bluetooth
+            bursts cannot make the cursor jump; click tolerance so the cursor
+            does not creep while you press.
+  scroll    synthesized from the touch surface (the kernel's emulated wheel is
+            ignored): a finger has to travel a little before scrolling starts,
+            scrolling never starts while the pointer is moving, one axis at a
+            time, natural direction, speed ramps with finger speed.
+  momentum  flick and lift: the page keeps going and eases out.
+
+Hyprland only needs a flat profile for the virtual device (see hypr-input.lua).
+Config: ~/.config/magic-mouse/config.toml (hot-reloaded on save).
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import fcntl
+import glob
+import json
+import math
+import os
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+
+from evdev import InputDevice, UInput, ecodes as e
+
+VIRT_NAME = "magic-mouse-omarchy"
+APPLE_VENDORS = {0x004C, 0x05AC}
+MAGIC_MOUSE_PRODUCTS = {0x030D, 0x0269}  # Magic Mouse 1, Magic Mouse 2
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("MAGIC_MOUSE_CONFIG", "~/.config/magic-mouse/config.toml")
+)
+
+HIRES = 120  # REL_WHEEL_HI_RES units per wheel notch
+HIRES_PER_MM = 13.0  # base: 1 mm of finger = ~0.11 notch (about 6 px in most apps)
+# The kernel driver advertises the touch surface at 26 units/mm (X) and 70 units/mm
+# (Y), which is wrong: the reported ranges span the whole ~57 x 100 mm shell, so
+# both axes are really ~38 units/mm. Using the advertised values skews distances
+# and makes slightly diagonal swipes look horizontal. We use a uniform scale.
+TOUCH_UNITS_PER_MM = 38.0
+HORIZONTAL_RATIO = 2.0  # sideways travel must beat lengthwise travel by this much to scroll horizontally
+TICK_HZ = 125
+TICK = 1.0 / TICK_HZ
+RESCAN_SEC = 2.0
+NOMINAL_DT = 0.011  # Magic Mouse reports at ~90 Hz
+
+DEFAULTS = {
+    "pointer": {
+        "tracking_speed": 0.6875,  # macOS "Tracking speed" slider, 0.0 .. 3.0 (Apple default 0.6875)
+        "cpi": 1300,  # Magic Mouse sensor resolution
+        "speed": 1.0,  # extra multiplier on top of the macOS curve (screen DPI fudge)
+        "smoothing_ms": 30.0,  # velocity smoothing window
+        "click_hold_ms": 80.0,  # freeze pointer this long after a press...
+        "click_drag_units": 12.0,  # ...unless it moves this far (then it's a drag)
+    },
+    "scroll": {
+        "natural": True,  # content follows the finger (macOS)
+        "invert_y": False,  # flip if forward/back is wrong on your model
+        "invert_x": False,
+        "speed": 1.0,
+        "start_mm": 0.8,  # finger must travel this far before scrolling starts
+        "settle_ms": 150.0,  # no scroll start until the pointer has been still this long...
+        "settle_counts": 4.0,  # ...where "moving" means more than this many raw counts in that window
+        "accel": 0.6,  # 0 = linear, 1 = strong ramp with finger speed
+        "horizontal": True,
+    },
+    "buttons": {
+        "middle": "left",  # a click in the centre zone: "left" (macOS has no middle click), "middle", or "right"
+    },
+    "gestures": {
+        "swipe_pages": True,  # quick one-finger sideways flick = browser back / forward
+        "swipe_mm": 6.0,  # travel needed for a swipe
+        "two_finger_swipe_left": "dispatch workspace m+1",  # like "swipe between full-screen apps"
+        "two_finger_swipe_right": "dispatch workspace m-1",
+        "two_finger_double_tap": "",  # Mission Control on macOS; any "dispatch ..." or shell command
+        "double_tap": "",  # smart zoom on macOS; any "dispatch ..." or shell command
+    },
+    "battery": {
+        "enabled": True,  # ask the mouse for its charge (needs the udev rule for /dev/hidraw access)
+        "poll_minutes": 15.0,
+    },
+    "momentum": {
+        "enabled": True,
+        "flick": 900.0,  # hires units/s needed at lift to coast
+        "decay": 0.97,  # per 8 ms tick; lower = shorter glide
+        "stop": 60.0,
+        "max_seconds": 2.5,
+    },
+}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+# --------------------------------------------------------------------------- config
+def load_config(path: str) -> dict:
+    cfg = {k: dict(v) for k, v in DEFAULTS.items()}
+    try:
+        with open(path, "rb") as f:
+            user = tomllib.load(f)
+    except FileNotFoundError:
+        return cfg
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        log(f"config: {exc} (using defaults)")
+        return cfg
+    for sect, vals in user.items():
+        if sect not in cfg or not isinstance(vals, dict):
+            log(f"config: unknown section [{sect}] ignored")
+            continue
+        for k, v in vals.items():
+            if k in cfg[sect]:
+                cfg[sect][k] = v
+            else:
+                log(f"config: unknown key {sect}.{k} ignored")
+    return cfg
+
+
+def config_mtime(path: str) -> float:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return -1.0
+
+
+# --------------------------------------------------------------------------- devices
+def is_magic_mouse(dev: InputDevice) -> bool:
+    caps = dev.capabilities()
+    by_id = dev.info.vendor in APPLE_VENDORS and dev.info.product in MAGIC_MOUSE_PRODUCTS
+    by_name = "magic mouse" in dev.name.lower()
+    if not (by_id or by_name):
+        return False
+    return (
+        e.REL_X in caps.get(e.EV_REL, [])
+        and e.BTN_LEFT in caps.get(e.EV_KEY, [])
+        and e.EV_ABS in caps
+    )
+
+
+def find_mouse() -> InputDevice | None:
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        if dev.name == VIRT_NAME:
+            dev.close()
+            continue
+        if is_magic_mouse(dev):
+            return dev
+        dev.close()
+    return None
+
+
+def make_uinput() -> UInput:
+    cap = {
+        e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA],
+        e.EV_REL: [
+            e.REL_X, e.REL_Y,
+            e.REL_WHEEL, e.REL_HWHEEL,
+            e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES,
+        ],
+    }
+    return UInput(cap, name=VIRT_NAME, vendor=0x004C, product=0x0269, version=1)
+
+
+# --------------------------------------------------------------------------- macOS curve
+# Apple's pointer acceleration, straight from IOHIDFamily
+# (IOHIDEventSystemPlugIns/IOHIDAccelerationAlgorithm.cpp, IOHIDParametricAcceleration).
+# Ten stock curves indexed by the "Tracking speed" setting; the driver linearly
+# interpolates between the two nearest. Values are IOFixed (x / 65536):
+#   (Index, GainLinear, GainParabolic, GainCubic, GainQuartic, TangentSpeedLinear, TangentSpeedParabolicRoot)
+APPLE_CURVES_FIXED = [
+    (0,      65536, 0,      0,     0, 524288, 0),
+    (8192,   60293, 26214,  5243,  0, 537395, 1245184),
+    (32768,  60948, 36045,  6554,  0, 543949, 1179648),
+    (45056,  61604, 46531,  7864,  0, 550502, 1114112),
+    (57344,  62259, 57672,  9830,  0, 557056, 1048576),
+    (65536,  62915, 69468,  11796, 0, 563610, 983040),
+    (98304,  63570, 81920,  14418, 0, 570163, 917504),
+    (131072, 64225, 95027,  17695, 0, 576717, 851968),
+    (163840, 64881, 108790, 21627, 0, 583270, 786432),
+    (196608, 65536, 123208, 26214, 0, 589824, 786432),
+]
+MAC_CURSOR_PPI = 96.0  # Apple maps curve output (cursor inches/s) to pixels at 96 px per inch
+
+
+class AppleCurve:
+    """f(x): mouse speed in inches/s -> cursor speed in inches/s (before the 96 ppi scale).
+
+    Three segments, exactly as Apple's driver: polynomial up to TangentSpeedLinear,
+    then its tangent line up to TangentSpeedParabolicRoot, then a square-root tail.
+    """
+
+    def __init__(self, tracking: float) -> None:
+        curves = [tuple(v / 65536.0 for v in c) for c in APPLE_CURVES_FIXED]
+        tracking = max(0.0, float(tracking))
+        cur = 0
+        for i, c in enumerate(curves):
+            if tracking >= c[0]:
+                cur = i
+        c0 = curves[cur]
+        if c0[0] < tracking and cur + 1 < len(curves):
+            c1 = curves[cur + 1]
+            r = (tracking - c0[0]) / (c1[0] - c0[0])
+            c = tuple(a + r * (b - a) for a, b in zip(c0, c1))
+        else:
+            c = c0
+        _, gl, gp, gc, gq, tl, tp = c
+        self.gl = gl
+        self.tl = tl
+        self.poly = lambda x: gl * x + (gp * x) ** 2 + (gc * x) ** 3 + (gq * x) ** 4
+        dpoly = lambda x: gl + 2 * x * gp**2 + 3 * x * x * gc**3 + 4 * x**3 * gq**4
+        self.t0 = self.t1 = float("inf")
+        self.m0 = self.b0 = self.m1 = self.b1 = 0.0
+        if tl != 0:
+            y0 = self.poly(tl)
+            self.m0 = dpoly(tl)
+            self.b0 = y0 - self.m0 * tl
+            self.t0 = tl
+            if tp != 0:
+                y1 = self.m0 * tp + self.b0
+                self.m1 = 2 * y1 * self.m0
+                self.b1 = y1 * y1 - self.m1 * tp
+                self.t1 = tp
+        elif tp != 0:
+            y0 = self.poly(tp)
+            self.m1 = dpoly(tp)
+            self.b1 = y0 * y0 - self.m1 * tp
+            self.t0 = tp
+
+    def f(self, x: float) -> float:
+        if x <= self.t0:
+            return self.poly(x)
+        if x <= self.t1 and self.t0 == self.tl:
+            return self.m0 * x + self.b0
+        return math.sqrt(max(self.m1 * x + self.b1, 0.0))
+
+    def gain(self, x: float) -> float:
+        """Cursor inches per mouse inch at mouse speed x (inches/s)."""
+        if x < 1e-6:
+            return self.gl
+        return self.f(x) / x
+
+
+# --------------------------------------------------------------------------- battery
+# The Magic Mouse reports its charge in HID *input* report 0x90, which it pushes
+# on its own schedule (can be a long while after connecting). The kernel/UPower
+# show 0% until then. A GET_REPORT on the raw HID node makes the mouse answer at
+# once; the kernel ignores that answer, so we publish it ourselves.
+BATTERY_REPORT_ID = 0x90
+STATUS_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "magic-mouse")
+STATUS_FILE = os.path.join(STATUS_DIR, "battery.json")
+
+
+def hidraw_for(dev: InputDevice) -> str | None:
+    want_uniq = f"HID_UNIQ={dev.uniq}".lower() if dev.uniq else None
+    want_id = f"HID_ID=0005:{dev.info.vendor:08X}:{dev.info.product:08X}"
+    for p in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            ue = open(f"{p}/device/uevent").read()
+        except OSError:
+            continue
+        if (want_uniq and want_uniq in ue.lower()) or want_id in ue:
+            return "/dev/" + os.path.basename(p)
+    return None
+
+
+def parse_battery_report(buf: bytes) -> tuple[int, bool] | None:
+    """report 0x90: [id, flags, percent, ...]; flags bit2 = charging (usage 0x85/0x44)."""
+    if len(buf) < 3 or buf[0] != BATTERY_REPORT_ID:
+        return None
+    percent = int(buf[2])
+    if not 0 <= percent <= 100:
+        return None
+    return percent, bool(buf[1] & 0x04)
+
+
+def query_battery(hidraw: str) -> tuple[int, bool] | None:
+    buf = bytearray(4)
+    buf[0] = BATTERY_REPORT_ID
+    ioc = (3 << 30) | (len(buf) << 16) | (ord("H") << 8) | 0x0A  # HIDIOCGINPUT(len)
+    try:
+        with open(hidraw, "rb+", buffering=0) as f:
+            fcntl.ioctl(f, ioc, buf)
+    except OSError as exc:
+        log(f"battery: {hidraw}: {exc}")
+        return None
+    return parse_battery_report(bytes(buf))
+
+
+def write_status(data: dict) -> None:
+    try:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATUS_FILE)
+    except OSError as exc:
+        log(f"status: {exc}")
+
+
+# --------------------------------------------------------------------------- actions
+def hypr_socket() -> str | None:
+    rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if sig and os.path.exists(f"{rt}/hypr/{sig}/.socket.sock"):
+        return f"{rt}/hypr/{sig}/.socket.sock"
+    socks = glob.glob(f"{rt}/hypr/*/.socket.sock")
+    return max(socks, key=os.path.getmtime) if socks else None
+
+
+def run_action(cmd: str) -> None:
+    """'dispatch ...' / 'keyword ...' go straight to Hyprland; anything else is a shell command."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return
+    if cmd.split()[0] in ("dispatch", "keyword"):
+        def send() -> None:
+            sock = hypr_socket()
+            if not sock:
+                log("action: no Hyprland socket")
+                return
+            try:
+                with socket.socket(socket.AF_UNIX) as c:
+                    c.settimeout(1.0)
+                    c.connect(sock)
+                    c.sendall(cmd.encode())
+                    c.recv(4096)
+            except OSError as exc:
+                log(f"action failed: {exc}")
+        threading.Thread(target=send, daemon=True).start()
+    else:
+        try:
+            subprocess.Popen(cmd, shell=True, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log(f"action failed: {exc}")
+
+
+# --------------------------------------------------------------------------- engine
+class Engine:
+    def __init__(self, cfg: dict, ui: UInput, verbose: bool) -> None:
+        self.cfg = cfg
+        self.ui = ui
+        self.verbose = verbose
+        self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
+        self.res_x = TOUCH_UNITS_PER_MM
+        self.res_y = TOUCH_UNITS_PER_MM
+        # frame accumulators
+        self.f_dx = 0
+        self.f_dy = 0
+        self.f_btn: list[tuple[int, int]] = []
+        # pointer
+        self.v = 0.0
+        self.last_motion_t = -1.0
+        self.rem_x = 0.0
+        self.rem_y = 0.0
+        self.hold_until = 0.0
+        self.hold_acc = [0.0, 0.0]
+        self.recent: collections.deque = collections.deque()  # (ts, raw distance) for the settle rule
+        # touch
+        self.slots: dict[int, list] = {}  # slot -> [tracking_id, x, y]
+        self.cur_slot = 0
+        self.primary: int | None = None
+        self.t_ref: tuple[int, int] | None = None
+        self.scrolling = False
+        self.axis = "y"
+        self.s_rem = 0.0
+        self.s_notch = 0
+        self.s_vel = 0.0
+        self.s_last_t = -1.0
+        self.s_travel = 0.0  # signed mm along the locked axis this scroll
+        self.scroll_t0 = 0.0
+        # touch session (first finger down .. last finger up) and gestures
+        self.session_open = False
+        self.session_t0 = 0.0
+        self.session_travel = 0.0
+        self.session_clicked = False
+        self.max_fingers = 0
+        self.gesture_fired = False
+        self.two_ref: tuple[float, float] | None = None
+        self.last_tap_t = -1.0
+        self.last_tap_fingers = 0
+        # momentum
+        self.coasting = False
+        self.c_vel = 0.0
+        self.c_t0 = 0.0
+
+    # ---- device attach
+    def attach(self, dev: InputDevice) -> None:
+        self.reset_touch()
+        self.v = 0.0
+        self.last_motion_t = -1.0
+
+    def reset_touch(self) -> None:
+        self.slots.clear()
+        self.cur_slot = 0
+        self.primary = None
+        self.t_ref = None
+        self.scrolling = False
+        self.session_open = False
+        self.two_ref = None
+        self.stop_coast("reset")
+
+    def update_config(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
+
+    # ---- helpers
+    def fingers(self) -> list[int]:
+        return sorted(s for s, v in self.slots.items() if v[0] >= 0)
+
+    def pointer_gain(self, v: float) -> float:
+        """Pixels per raw count at smoothed speed v (raw counts/ms), macOS style."""
+        p = self.cfg["pointer"]
+        cpi = max(float(p["cpi"]), 1.0)
+        x = v * 1000.0 / cpi  # inches per second
+        return self.curve.gain(x) * MAC_CURSOR_PPI / cpi * float(p["speed"])
+
+    def emit_rel(self, code: int, value: int) -> None:
+        if value:
+            self.ui.write(e.EV_REL, code, value)
+
+    def emit_scroll(self, hires: float, axis: str) -> None:
+        """Accumulate fractional hi-res units, emit hi-res + notch events."""
+        self.s_rem += hires
+        n = int(self.s_rem)
+        if n == 0:
+            return
+        self.s_rem -= n
+        if axis == "y":
+            self.emit_rel(e.REL_WHEEL_HI_RES, n)
+        else:
+            self.emit_rel(e.REL_HWHEEL_HI_RES, n)
+        self.s_notch += n
+        while abs(self.s_notch) >= HIRES:
+            step = 1 if self.s_notch > 0 else -1
+            self.emit_rel(e.REL_WHEEL if axis == "y" else e.REL_HWHEEL, step)
+            self.s_notch -= step * HIRES
+
+    # ---- event intake
+    def feed(self, ev) -> None:
+        if ev.type == e.EV_SYN:
+            if ev.code == e.SYN_REPORT:
+                self.process_frame(ev.timestamp())
+            return
+        if ev.type == e.EV_REL:
+            if ev.code == e.REL_X:
+                self.f_dx += ev.value
+            elif ev.code == e.REL_Y:
+                self.f_dy += ev.value
+            # kernel's emulated wheel is ignored; scroll is synthesized from touch
+            return
+        if ev.type == e.EV_KEY:
+            if ev.code in (e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE):
+                self.f_btn.append((ev.code, ev.value))
+            return
+        if ev.type == e.EV_ABS:
+            if ev.code == e.ABS_MT_SLOT:
+                self.cur_slot = ev.value
+            else:
+                slot = self.slots.setdefault(self.cur_slot, [-1, 0, 0])
+                if ev.code == e.ABS_MT_TRACKING_ID:
+                    slot[0] = ev.value
+                elif ev.code == e.ABS_MT_POSITION_X:
+                    slot[1] = ev.value
+                elif ev.code == e.ABS_MT_POSITION_Y:
+                    slot[2] = ev.value
+            return
+
+    # ---- per-frame processing
+    def process_frame(self, ts: float) -> None:
+        dx, dy, btns = self.f_dx, self.f_dy, self.f_btn
+        self.f_dx = self.f_dy = 0
+        self.f_btn = []
+
+        # buttons first, so motion in the press frame is covered by click tolerance
+        clicked = False
+        for code, value in btns:
+            code = self.map_button(code)
+            if value == 1:
+                clicked = True
+                self.stop_coast("button")
+                self.hold_until = ts + float(self.cfg["pointer"]["click_hold_ms"]) / 1000.0
+                self.hold_acc = [0.0, 0.0]
+            self.ui.write(e.EV_KEY, code, value)
+
+        if dx or dy:
+            self.pointer(ts, dx, dy)
+
+        self.touch(ts)
+        if clicked:
+            self.session_clicked = True  # after touch(), so a same-frame landing can't reset it
+        self.ui.syn()
+
+    def pointer(self, ts: float, dx: int, dy: int) -> None:
+        p = self.cfg["pointer"]
+        dt = ts - self.last_motion_t if self.last_motion_t >= 0 else NOMINAL_DT
+        if dt > 0.2:
+            self.v = 0.0
+            dt = NOMINAL_DT
+        self.last_motion_t = ts
+        dist = math.hypot(dx, dy)
+        self.recent.append((ts, dist))
+        # Smoothed velocity. A burst frame (dt ~ 0) gets ~zero weight, so it
+        # cannot spike the estimate the way it does inside libinput.
+        if dt > 0:
+            v_inst = dist / (dt * 1000.0)
+            a = 1.0 - math.exp(-(dt * 1000.0) / max(float(p["smoothing_ms"]), 1.0))
+            self.v += a * (v_inst - self.v)
+
+        if ts < self.hold_until:
+            self.hold_acc[0] += dx
+            self.hold_acc[1] += dy
+            if math.hypot(*self.hold_acc) < float(p["click_drag_units"]):
+                return  # click tolerance: swallow the creep
+            self.hold_until = 0.0
+            dx, dy = self.hold_acc
+            self.hold_acc = [0.0, 0.0]
+
+        gain = self.pointer_gain(self.v)
+        ox = dx * gain + self.rem_x
+        oy = dy * gain + self.rem_y
+        ix, iy = int(ox), int(oy)
+        self.rem_x, self.rem_y = ox - ix, oy - iy
+        self.emit_rel(e.REL_X, ix)
+        self.emit_rel(e.REL_Y, iy)
+
+    def map_button(self, code: int) -> int:
+        if code != e.BTN_MIDDLE:
+            return code
+        want = str(self.cfg["buttons"]["middle"]).lower()
+        return {"left": e.BTN_LEFT, "right": e.BTN_RIGHT}.get(want, e.BTN_MIDDLE)
+
+    def nav(self, back: bool) -> None:
+        code = e.BTN_SIDE if back else e.BTN_EXTRA
+        self.ui.write(e.EV_KEY, code, 1)
+        self.ui.syn()
+        self.ui.write(e.EV_KEY, code, 0)
+        self.ui.syn()
+        if self.verbose:
+            log("swipe: " + ("back" if back else "forward"))
+
+    def pointer_moving(self, ts: float) -> bool:
+        """Settle rule: has the pointer really moved within the last settle_ms?"""
+        s = self.cfg["scroll"]
+        cut = ts - float(s["settle_ms"]) / 1000.0
+        while self.recent and self.recent[0][0] < cut:
+            self.recent.popleft()
+        return sum(d for _, d in self.recent) > float(s["settle_counts"])
+
+    def touch(self, ts: float) -> None:
+        active = self.fingers()
+        n = len(active)
+        if n == 0:
+            if self.session_open:
+                self.end_session(ts)
+            return
+        if not self.session_open:
+            self.session_open = True
+            self.session_t0 = ts
+            self.session_travel = 0.0
+            self.session_clicked = False
+            self.max_fingers = 0
+            self.gesture_fired = False
+            self.two_ref = None
+            self.primary = None
+            self.stop_coast("touch")
+        self.max_fingers = max(self.max_fingers, n)
+        if n >= 2:
+            self.two_fingers(ts, active)
+        else:
+            self.one_finger(ts, active[0])
+
+    def two_fingers(self, ts: float, active: list[int]) -> None:
+        g = self.cfg["gestures"]
+        if self.scrolling:
+            self.scrolling = False  # two fingers never scroll (as on macOS)
+        self.primary = None
+        self.t_ref = None
+        cx = sum(self.slots[i][1] for i in active) / len(active)
+        cy = sum(self.slots[i][2] for i in active) / len(active)
+        if self.two_ref is None:
+            self.two_ref = (cx, cy)
+            return
+        dx_mm = (cx - self.two_ref[0]) / self.res_x
+        dy_mm = (cy - self.two_ref[1]) / self.res_y
+        self.session_travel = max(self.session_travel, math.hypot(dx_mm, dy_mm))
+        if self.gesture_fired:
+            return
+        if abs(dx_mm) >= float(g["swipe_mm"]) and abs(dx_mm) > HORIZONTAL_RATIO * abs(dy_mm):
+            self.gesture_fired = True
+            action = g["two_finger_swipe_left"] if dx_mm < 0 else g["two_finger_swipe_right"]
+            if self.verbose:
+                log("two-finger swipe " + ("left" if dx_mm < 0 else "right"))
+            run_action(str(action))
+
+    def one_finger(self, ts: float, primary: int) -> None:
+        s = self.cfg["scroll"]
+        _, x, y = self.slots[primary]
+        if primary != self.primary or self.t_ref is None:
+            # a finger just landed (or we came back from two fingers): re-anchor, no scroll yet
+            self.primary = primary
+            self.t_ref = (x, y)
+            self.scrolling = False
+            self.s_vel = 0.0
+            self.s_last_t = ts
+            return
+
+        rx, ry = self.t_ref
+        dx_mm = (x - rx) / self.res_x
+        dy_mm = (y - ry) / self.res_y
+        self.session_travel += math.hypot(dx_mm, dy_mm)
+
+        if not self.scrolling:
+            if self.pointer_moving(ts):
+                self.t_ref = (x, y)  # resting finger while mousing: never a scroll
+                return
+            if math.hypot(dx_mm, dy_mm) < float(s["start_mm"]):
+                return
+            self.axis = "x" if abs(dx_mm) > HORIZONTAL_RATIO * abs(dy_mm) else "y"
+            if self.axis == "x" and not s["horizontal"]:
+                self.t_ref = (x, y)
+                return
+            self.scrolling = True
+            self.scroll_t0 = ts
+            self.s_travel = 0.0
+            self.t_ref = (x, y)  # the start travel is swallowed, like macOS
+            self.s_vel = 0.0
+            self.s_last_t = ts
+            if self.verbose:
+                log(f"scroll start axis={self.axis}")
+            return
+
+        # scrolling
+        self.t_ref = (x, y)
+        d_mm = dy_mm if self.axis == "y" else dx_mm
+        if d_mm == 0.0:
+            return
+        self.s_travel += d_mm
+        dt = max(ts - self.s_last_t, 0.001)
+        self.s_last_t = ts
+        speed_mm_s = abs(d_mm) / dt
+        ramp = 1.0 + float(s["accel"]) * min(max((speed_mm_s - 75.0) / 370.0, 0.0), 2.0)
+        sign = self.scroll_sign(self.axis)
+        hires = sign * d_mm * HIRES_PER_MM * float(s["speed"]) * ramp
+        self.emit_scroll(hires, self.axis)
+        inst = hires / dt
+        a = 1.0 - math.exp(-(dt * 1000.0) / 60.0)
+        self.s_vel += a * (inst - self.s_vel)
+
+    def scroll_sign(self, axis: str) -> float:
+        """Map finger travel (touch units) to wheel sign.
+
+        Kernel convention for the emulated wheel: finger moving toward the
+        front of the mouse = ABS y decreasing = wheel rolled forward (positive,
+        scroll up). Natural inverts that so content follows the finger.
+        """
+        s = self.cfg["scroll"]
+        if axis == "y":
+            sign = -1.0  # y decreasing (forward) -> positive wheel (non-natural)
+            if s["invert_y"]:
+                sign = -sign
+        else:
+            sign = 1.0  # x increasing (right) -> positive hwheel (scroll right)
+            if s["invert_x"]:
+                sign = -sign
+        if s["natural"]:
+            sign = -sign
+        return sign
+
+    def end_session(self, ts: float) -> None:
+        g = self.cfg["gestures"]
+        m = self.cfg["momentum"]
+        dur = ts - self.session_t0
+        if self.scrolling:
+            swipe = (
+                self.axis == "x" and g["swipe_pages"]
+                and (ts - self.scroll_t0) < 0.4 and abs(self.s_travel) >= float(g["swipe_mm"])
+            )
+            if swipe:
+                self.nav(back=self.s_travel > 0)  # finger moving right = back, like macOS
+            elif m["enabled"] and abs(self.s_vel) >= float(m["flick"]):
+                self.coasting = True
+                self.c_vel = self.s_vel
+                self.c_t0 = ts
+                self.s_rem = 0.0
+                if self.verbose:
+                    log(f"coast start {self.c_vel:.0f} hires/s axis={self.axis}")
+        elif (not self.session_clicked and not self.gesture_fired
+              and self.session_travel < 2.0 and dur < 0.3):
+            # a tap (touch without click or travel); two in a row is a double tap
+            if self.last_tap_t >= 0 and ts - self.last_tap_t < 0.4 and self.last_tap_fingers == self.max_fingers:
+                self.last_tap_t = -1.0
+                action = g["two_finger_double_tap"] if self.max_fingers >= 2 else g["double_tap"]
+                if self.verbose:
+                    log(f"double tap ({self.max_fingers} finger)")
+                run_action(str(action))
+            else:
+                self.last_tap_t = ts
+                self.last_tap_fingers = self.max_fingers
+        self.scrolling = False
+        self.t_ref = None
+        self.primary = None
+        self.session_open = False
+
+    # ---- momentum
+    def stop_coast(self, why: str) -> None:
+        if self.coasting and self.verbose:
+            log(f"coast stop ({why})")
+        self.coasting = False
+        self.c_vel = 0.0
+
+    def tick(self, now: float) -> None:
+        if not self.coasting:
+            return
+        m = self.cfg["momentum"]
+        if now - self.c_t0 > float(m["max_seconds"]) or abs(self.c_vel) < float(m["stop"]):
+            self.stop_coast("decay")
+            return
+        self.emit_scroll(self.c_vel * TICK, self.axis)
+        self.ui.syn()
+        self.c_vel *= float(m["decay"])
+
+
+# --------------------------------------------------------------------------- main loop
+def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str) -> None:
+    log(f"grab {dev.path} ({dev.name} {dev.info.vendor:04x}:{dev.info.product:04x})")
+    dev.grab()
+    eng.attach(dev)
+    mtime = config_mtime(cfg_path)
+    next_cfg_check = time.monotonic() + 1.0
+    hidraw = hidraw_for(dev)
+    next_battery = 0.0
+    write_status({"connected": True, "model": dev.name, "ts": time.time()})
+    try:
+        while True:
+            now = time.monotonic()
+            if eng.cfg["battery"]["enabled"] and now >= next_battery:
+                next_battery = now + max(float(eng.cfg["battery"]["poll_minutes"]), 1.0) * 60.0
+                got = query_battery(hidraw) if hidraw else None
+                if got:
+                    percent, charging = got
+                    write_status({"connected": True, "model": dev.name, "percent": percent,
+                                  "charging": charging, "ts": time.time()})
+                    log(f"battery {percent}%" + (" charging" if charging else ""))
+                elif hidraw is None:
+                    log("battery: no hidraw node found for the mouse")
+            timeout = TICK if eng.coasting else 0.25
+            r, _, _ = select.select([dev.fd], [], [], timeout)
+            now = time.monotonic()
+            if r:
+                try:
+                    for ev in dev.read():
+                        eng.feed(ev)
+                except OSError as exc:
+                    log(f"device gone: {exc}")
+                    return
+            if eng.coasting:
+                eng.tick(time.time())
+            if now >= next_cfg_check:
+                next_cfg_check = now + 1.0
+                m = config_mtime(cfg_path)
+                if m != mtime:
+                    mtime = m
+                    eng.update_config(load_config(cfg_path))
+                    log("config reloaded")
+    finally:
+        for fn in (dev.ungrab, dev.close):
+            try:
+                fn()
+            except OSError:
+                pass
+        eng.reset_touch()
+        write_status({"connected": False, "model": dev.name, "ts": time.time()})
+        log("released grab")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Mac-like Magic Mouse daemon")
+    ap.add_argument("--config", default=CONFIG_PATH, help="TOML config path")
+    ap.add_argument("--verbose", action="store_true", help="log scroll starts and momentum")
+    ap.add_argument("--list", action="store_true", help="show detected Magic Mouse and exit")
+    args = ap.parse_args()
+
+    if args.list:
+        dev = find_mouse()
+        if not dev:
+            print("no Magic Mouse found (is it connected? is hid_magicmouse bound?)")
+            return 1
+        print(f"{dev.path}: {dev.name} {dev.info.vendor:04x}:{dev.info.product:04x}")
+        return 0
+
+    cfg = load_config(args.config)
+    log(f"magic-mouse-daemon pid={os.getpid()} config={args.config}")
+    ui = make_uinput()
+    log(f"virtual device '{VIRT_NAME}' ready")
+    eng = Engine(cfg, ui, args.verbose)
+    try:
+        while True:
+            dev = find_mouse()
+            if dev is None:
+                time.sleep(RESCAN_SEC)
+                continue
+            eng.update_config(load_config(args.config))
+            run_session(dev, ui, eng, args.config)
+            time.sleep(RESCAN_SEC)
+    except KeyboardInterrupt:
+        log("interrupt")
+    finally:
+        ui.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

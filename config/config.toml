@@ -1,0 +1,44 @@
+# omarchy-magic-mouse — ~/.config/magic-mouse/config.toml
+# Saved changes apply live (no restart). Delete a line to get its default back.
+
+[pointer]
+# The pointer curve is Apple's own (from IOHIDFamily), driven by the same slider.
+tracking_speed = 0.6875  # macOS "Tracking speed": 0.0 (slowest) .. 3.0 (fastest). Apple default 0.6875
+cpi = 1300               # Magic Mouse sensor resolution; leave it
+speed = 1.0              # extra multiplier if your screen's pixel density differs from a Mac's
+smoothing_ms = 30        # velocity smoothing; higher = calmer, slightly laggier
+click_hold_ms = 80       # after a press, freeze the pointer this long...
+click_drag_units = 12    # ...unless it moves this far (then it's a drag)
+
+[scroll]
+natural = true       # content follows the finger, like macOS. false = wheel style
+invert_y = false     # flip if forward/back is reversed on your model
+invert_x = false
+speed = 1.0
+start_mm = 0.8       # finger must travel this far (mm) before a scroll starts
+settle_ms = 150      # a scroll can't start until the pointer has been still this long...
+settle_counts = 4    # ...where "still" allows this many raw counts of wobble in that window
+accel = 0.6          # 0 = linear, 1 = strong ramp with finger speed
+horizontal = true
+
+[buttons]
+middle = "left"      # click in the centre zone: "left" (macOS has no middle click), "middle" (paste on Linux), "right"
+
+[gestures]
+swipe_pages = true   # quick one-finger sideways flick = back / forward in browsers
+swipe_mm = 6.0       # finger travel that counts as a swipe
+two_finger_swipe_left = "dispatch workspace m+1"    # like macOS "swipe between full-screen apps"
+two_finger_swipe_right = "dispatch workspace m-1"
+two_finger_double_tap = ""   # Mission Control on macOS. Any "dispatch ..." (Hyprland) or shell command
+double_tap = ""              # smart zoom on macOS. Same rules
+
+[battery]
+enabled = true       # ask the mouse for its charge at connect and every poll_minutes (needs the udev rule)
+poll_minutes = 15
+
+[momentum]
+enabled = true
+flick = 900          # how hard a flick must be to keep gliding
+decay = 0.97         # per 8 ms tick; lower = shorter glide (0.95 short, 0.985 long). macOS is ~0.984
+stop = 60
+max_seconds = 2.5
