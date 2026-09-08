@@ -88,6 +88,7 @@ BarWidget {
   onPercentChanged: injectPanel()
   onConnectedChanged: injectPanel()
 
+  readonly property bool showPercent: panelLoader.item && panelLoader.item.val ? panelLoader.item.val("bar", "show_percent", true) === true : true
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   function open() { if (panelLoader.item && panelLoader.item.openFromHotkey) panelLoader.item.openFromHotkey() }
   function close() { if (panelLoader.item && panelLoader.item.close) panelLoader.item.close() }
@@ -120,7 +121,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.connected ? (root.charging ? "󰍽󱐋 " : "󰍽 ") + (root.known ? root.percent + "%" : "–") : ""
+    text: root.connected ? (root.charging ? "󰍽󱐋" : "󰍽") + (root.showPercent ? " " + (root.known ? root.percent + "%" : "–") : "") : ""
     active: root.low
     tooltipText: root.connected ? root.modelName + (root.known ? " battery " + root.percent + "% (" + root.stateText + ")" : " battery: waiting for the mouse to report") : ""
     onPressed: function(b) {

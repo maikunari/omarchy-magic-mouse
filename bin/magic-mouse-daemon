@@ -81,10 +81,14 @@ DEFAULTS = {
     "gestures": {
         "swipe_pages": True,  # quick one-finger sideways flick = browser back / forward
         "swipe_mm": 6.0,  # travel needed for a swipe
-        "two_finger_swipe_left": "dispatch workspace m+1",  # like "swipe between full-screen apps"
-        "two_finger_swipe_right": "dispatch workspace m-1",
+        # Hyprland's socket takes Lua: "dispatch <lua>" runs hl.dispatch(<lua>). Same call as Omarchy's Super+Tab.
+        "two_finger_swipe_left": 'dispatch hl.dsp.focus({ workspace = "e+1" })',  # like "swipe between full-screen apps"
+        "two_finger_swipe_right": 'dispatch hl.dsp.focus({ workspace = "e-1" })',
         "two_finger_double_tap": "",  # Mission Control on macOS; any "dispatch ..." or shell command
         "double_tap": "",  # smart zoom on macOS; any "dispatch ..." or shell command
+    },
+    "bar": {
+        "show_percent": True,  # bar widget: show the number next to the icon (the panel's switch)
     },
     "battery": {
         "enabled": True,  # ask the mouse for its charge (needs the udev rule for /dev/hidraw access)
@@ -322,7 +326,11 @@ def hypr_socket() -> str | None:
 
 
 def run_action(cmd: str) -> None:
-    """'dispatch ...' / 'keyword ...' go straight to Hyprland; anything else is a shell command."""
+    """'dispatch ...' / 'keyword ...' go straight to Hyprland's socket; anything else is a shell command.
+
+    On Lua-config Hyprland (Omarchy 4+) the dispatch payload is Lua, e.g.
+    dispatch hl.dsp.focus({ workspace = "e+1" }). Older Hyprland takes dispatch workspace e+1.
+    """
     cmd = (cmd or "").strip()
     if not cmd:
         return

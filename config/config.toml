@@ -27,10 +27,14 @@ middle = "left"      # click in the centre zone: "left" (macOS has no middle cli
 [gestures]
 swipe_pages = true   # quick one-finger sideways flick = back / forward in browsers
 swipe_mm = 6.0       # finger travel that counts as a swipe
-two_finger_swipe_left = "dispatch workspace m+1"    # like macOS "swipe between full-screen apps"
-two_finger_swipe_right = "dispatch workspace m-1"
+# Hyprland's socket takes Lua here (same call as Omarchy's Super+Tab). Older Hyprland: "dispatch workspace e+1"
+two_finger_swipe_left = 'dispatch hl.dsp.focus({ workspace = "e+1" })'    # like macOS "swipe between full-screen apps"
+two_finger_swipe_right = 'dispatch hl.dsp.focus({ workspace = "e-1" })'
 two_finger_double_tap = ""   # Mission Control on macOS. Any "dispatch ..." (Hyprland) or shell command
 double_tap = ""              # smart zoom on macOS. Same rules
+
+[bar]
+show_percent = true  # show the number next to the mouse icon in the bar
 
 [battery]
 enabled = true       # ask the mouse for its charge at connect and every poll_minutes (needs the udev rule)

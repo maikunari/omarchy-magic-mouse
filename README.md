@@ -63,7 +63,7 @@ Hyprland only needs a flat profile for the virtual device; the installer adds it
 | Secondary click on the right side | done by the mouse itself |
 | No middle click | `buttons.middle = "left"` |
 | Swipe between pages (one finger) | back / forward buttons |
-| Swipe between full-screen apps (two fingers) | workspace switch |
+| Swipe between full-screen apps (two fingers) | workspace switch (`hl.dsp.focus({ workspace = "e+1" })`) |
 | Mission Control (two-finger double tap) | hook, off by default |
 | Smart zoom (one-finger double tap) | hook, off by default |
 | Battery level | bar widget (`io.github.maikunari.magic-mouse`) |

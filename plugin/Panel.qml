@@ -108,8 +108,9 @@ Panel {
     path: Quickshell.env("HOME") + "/.config/magic-mouse/config.toml"
     watchChanges: true
     printErrors: false
-    onFileChanged: if (root.opened && !writeTimer.running && !writeProc.running) root.refresh()
+    onFileChanged: if (!writeTimer.running && !writeProc.running) root.refresh()
   }
+  Component.onCompleted: root.refresh()
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.4)
@@ -286,9 +287,18 @@ Panel {
           checked: String(root.val("gestures", "two_finger_swipe_left", "")) !== ""
           onToggled: {
             var on = String(root.val("gestures", "two_finger_swipe_left", "")) !== ""
-            root.set("gestures", "two_finger_swipe_left", on ? "" : "dispatch workspace m+1")
-            root.set("gestures", "two_finger_swipe_right", on ? "" : "dispatch workspace m-1")
+            root.set("gestures", "two_finger_swipe_left", on ? "" : 'dispatch hl.dsp.focus({ workspace = "e+1" })')
+            root.set("gestures", "two_finger_swipe_right", on ? "" : 'dispatch hl.dsp.focus({ workspace = "e-1" })')
           }
+        }
+
+        // ---------- Bar ----------
+        PanelSectionHeader { text: "BAR"; foreground: root.fg; fontFamily: root.fontFam }
+        SwitchRow {
+          label: "Show battery percentage"
+          description: "Off shows just the icon; low battery still highlights"
+          checked: root.val("bar", "show_percent", true) === true
+          onToggled: root.set("bar", "show_percent", !(root.val("bar", "show_percent", true) === true))
         }
 
         Text {
