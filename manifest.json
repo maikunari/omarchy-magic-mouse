@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.maikunari.magic-mouse",
+  "name": "Magic Mouse",
+  "version": "1.1.0",
+  "author": "Mike Sewell",
+  "license": "MIT",
+  "description": "Make an Apple Magic Mouse feel like a Mac: Apple's pointer curve, sane scrolling, momentum, gestures, battery in the bar and a settings popup",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Magic Mouse",
+    "description": "Mouse battery in the bar; click for pointer, scroll, momentum and gesture settings",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

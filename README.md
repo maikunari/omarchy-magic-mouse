@@ -71,11 +71,22 @@ Hyprland only needs a flat profile for the virtual device; the installer adds it
 
 ## Install
 
+This repo is an Omarchy plugin (the bar widget and settings popup) that ships
+its own helper daemon. Two steps:
+
 ```sh
-git clone https://github.com/maikunari/omarchy-magic-mouse
-cd omarchy-magic-mouse
-./install.sh
+# 1. the plugin: clones into ~/.config/omarchy/plugins/ and enables the bar widget
+omarchy plugin add https://github.com/maikunari/omarchy-magic-mouse --enable
+
+# 2. the daemon, udev rule, driver option and Hyprland snippet (asks for your password once)
+~/.config/omarchy/plugins/io.github.maikunari.magic-mouse/install.sh
 ```
+
+Later updates: `omarchy plugin update io.github.maikunari.magic-mouse`, then
+re-run `install.sh` to refresh the daemon.
+
+Prefer a plain checkout? `git clone` anywhere and run `./install.sh`; it copies
+the widget into the plugins directory for you.
 
 Pair the mouse with Bluetooth as usual. The daemon waits for it and grabs it
 whenever it connects. If the installer added you to the `input` group, log out
@@ -108,11 +119,39 @@ effective config as JSON.
 | glide too long / too short | `momentum.decay` 0.95 / 0.985 |
 | no glide | `momentum.enabled = false` |
 
-## Uninstall
+## Remove
 
 ```sh
-./uninstall.sh
+~/.config/omarchy/plugins/io.github.maikunari.magic-mouse/uninstall.sh   # daemon, unit, udev rule, driver option
+omarchy plugin remove io.github.maikunari.magic-mouse                     # the widget
 ```
+
+`uninstall.sh` leaves `~/.config/magic-mouse/config.toml` and the small
+`magic-mouse-omarchy` device block in your Hyprland input config; delete those
+by hand if you want a clean slate.
+
+## What the installer touches
+
+Everything is listed so you can decide before running it:
+
+| Path | What |
+|---|---|
+| `~/.local/bin/magic-mouse-daemon`, `magic-mouse-config`, `magic-mouse-battery-query` | the daemon and its two helpers |
+| `~/.config/systemd/user/magic-mouse.service` | user service, enabled and started |
+| `~/.config/magic-mouse/config.toml` | your settings (only created if missing) |
+| `~/.config/hypr/input.lua` (or `input.conf`) | a 7-line device block, **appended only after asking**, with a backup |
+| `/etc/udev/rules.d/70-magic-mouse.rules` | via sudo/pkexec: lets your user read the mouse's input and raw HID nodes |
+| `/etc/modprobe.d/hid_magicmouse.conf` | via sudo/pkexec: `emulate_3button=0` |
+
+No sudoers changes, no NOPASSWD, nothing downloaded at install time. The
+daemon runs as your user, talks only to the local mouse and the Hyprland
+socket, and writes its status under `$XDG_RUNTIME_DIR/magic-mouse/`.
+
+## Dependencies
+
+- `python-evdev` (Arch package; the installer adds it with `omarchy pkg add`)
+- the in-kernel `hid_magicmouse` driver (ships with Arch) and `upower` (ships with Omarchy)
+- Omarchy shell for the bar widget; the daemon works on any Hyprland
 
 ## Notes
 
