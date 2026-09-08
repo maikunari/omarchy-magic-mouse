@@ -89,8 +89,7 @@ Prefer a plain checkout? `git clone` anywhere and run `./install.sh`; it copies
 the widget into the plugins directory for you.
 
 Pair the mouse with Bluetooth as usual. The daemon waits for it and grabs it
-whenever it connects. If the installer added you to the `input` group, log out
-and back in once.
+whenever it connects.
 
 Check it is running:
 
@@ -140,8 +139,16 @@ Everything is listed so you can decide before running it:
 | `~/.config/systemd/user/magic-mouse.service` | user service, enabled and started |
 | `~/.config/magic-mouse/config.toml` | your settings (only created if missing) |
 | `~/.config/hypr/input.lua` (or `input.conf`) | a 7-line device block, **appended only after asking**, with a backup |
-| `/etc/udev/rules.d/70-magic-mouse.rules` | via sudo/pkexec: lets your user read the mouse's input and raw HID nodes |
-| `/etc/modprobe.d/hid_magicmouse.conf` | via sudo/pkexec: `emulate_3button=0` |
+| `/etc/udev/rules.d/70-magic-mouse.rules` | via `sudo tee`: a `uaccess` rule for the mouse's input and raw HID nodes and for `/dev/uinput`, matched by device ID |
+| `/etc/modprobe.d/hid_magicmouse.conf` | via `sudo tee`: `emulate_3button=0` |
+
+Nothing from the checkout runs as root. The exact text of both `/etc` files is
+embedded in `install.sh`; the only privileged commands are the distro's `tee`,
+`udevadm` and (if `/dev/uinput` is missing) `modprobe`, each with fixed
+arguments, and the installer compares what landed against the embedded text
+before continuing. Access to the mouse comes from that device-specific
+`uaccess` rule alone: the installer never changes your group membership, and
+stops if your user still cannot open the device nodes afterwards.
 
 No sudoers changes, no NOPASSWD, nothing downloaded at install time. The
 daemon runs as your user, talks only to the local mouse and the Hyprland
