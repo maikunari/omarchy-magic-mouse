@@ -175,6 +175,11 @@ socket, and writes its status under `$XDG_RUNTIME_DIR/magic-mouse/`.
 - The installer writes `/etc/modprobe.d/hid_magicmouse.conf` with
   `emulate_3button=0`. The old `scroll_acceleration` / `scroll_speed` options
   only affect the kernel's emulated wheel, which this daemon ignores.
+- `config.toml` and the battery status file are only ever read and written
+  descriptor-first: no symlink following, no blocking on a planted FIFO,
+  owner/type/size checks before reading, and writes go to a random
+  same-directory `O_EXCL` temp file (mode 0600) that is fsynced and renamed
+  into place.
 - Bar widget settings (on its entry in `~/.config/omarchy/shell.json`):
   `"match": "MMM"` to pin it to one device by model name, `"lowAt": 20` for the
   low-battery highlight threshold.

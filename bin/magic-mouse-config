@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """magic-mouse-config: read or change ~/.config/magic-mouse/config.toml, keeping comments.
 
+File access goes through the daemon's read_own_file / write_own_file (no symlink
+following, no blocking on FIFOs, owner/type/size checks, random O_EXCL temp + rename).
+
   magic-mouse-config get                       # effective config as JSON (defaults merged)
   magic-mouse-config set pointer.tracking_speed=1.0 scroll.natural=true
 """
-import json, os, re, sys
+import errno, json, os, re, stat, sys
 
 CONFIG = os.path.expanduser(os.environ.get("MAGIC_MOUSE_CONFIG", "~/.config/magic-mouse/config.toml"))
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 
 def daemon_module():
-    src = open(os.path.join(HERE, "magic-mouse-daemon")).read()
+    # Same discipline as the daemon's read_own_file (which is not available yet):
+    # descriptor-first, no symlink following, no blocking, must be our regular file.
+    fd = os.open(os.path.join(HERE, "magic-mouse-daemon"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > (1 << 20):
+            raise OSError(errno.EINVAL, "magic-mouse-daemon is not a small regular file owned by this user")
+        src = os.read(fd, st.st_size + 1).decode("utf-8")
+    finally:
+        os.close(fd)
     mod = {"__name__": "magic_mouse_daemon"}
     exec(compile(src, "magic-mouse-daemon", "exec"), mod)
     mod["log"] = lambda msg: print(msg, file=sys.stderr)  # keep stdout clean for JSON
@@ -39,9 +51,12 @@ def fmt(v) -> str:
     return json.dumps(str(v))
 
 
-def set_values(pairs: list[tuple[str, str, object]]) -> None:
-    text = open(CONFIG).read() if os.path.exists(CONFIG) else ""
-    lines = text.split("\n")
+def set_values(pairs: list[tuple[str, str, object]], mod: dict) -> None:
+    try:
+        text = mod["read_own_file"](CONFIG).decode("utf-8")
+    except FileNotFoundError:
+        text = ""
+    lines = text.split("\n") if text else []
     for section, key, value in pairs:
         start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
         if start is None:
@@ -58,11 +73,7 @@ def set_values(pairs: list[tuple[str, str, object]]) -> None:
                 break
         else:
             lines.insert(start + 1, f"{key} = {fmt(value)}")
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w") as f:
-        f.write("\n".join(lines))
-    os.replace(tmp, CONFIG)
+    mod["write_own_file"](CONFIG, "\n".join(lines).encode("utf-8"))
 
 
 def main(argv: list[str]) -> int:
@@ -79,7 +90,11 @@ def main(argv: list[str]) -> int:
             path, raw = item.split("=", 1)
             section, key = path.split(".", 1)
             pairs.append((section, key, parse_value(raw)))
-        set_values(pairs)
+        try:
+            set_values(pairs, daemon_module())
+        except OSError as exc:
+            print(f"config: {exc}", file=sys.stderr)
+            return 1
         return 0
     print(__doc__, file=sys.stderr)
     return 2
