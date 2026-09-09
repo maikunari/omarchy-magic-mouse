@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # omarchy-magic-mouse installer. Safe to re-run.
 #
-# Privilege model: nothing from this checkout is ever executed as root. The two
-# files written under /etc are fixed text embedded below; root only runs the
-# distro-owned tee / udevadm / modprobe binaries with fixed arguments, and the
-# installer verifies what landed against the embedded text before going on.
+# Privilege model: no file from this checkout is ever executed as root. The
+# only privileged step is one fixed Python helper embedded below (see the
+# comment above it), run by the distro's python3; it carries the exact bytes
+# of the two /etc files and installs them atomically with fail-closed checks.
 # Access to the mouse comes from the device-specific uaccess udev rule alone:
 # the installer never changes group membership, and stops if the rule did not
 # take effect.
@@ -35,12 +35,22 @@ if [ ! -f "$HOME/.config/magic-mouse/config.toml" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Root step. The exact content of both files, so it can be reviewed here.
+# Root step. One fixed helper, embedded here so the exact bytes are in the
+# reviewed file, handed to the distro's python3 on the command line: it is in
+# memory before sudo runs, so nothing on disk can be swapped in between the
+# password prompt and execution. It walks to each target directory one
+# component at a time with O_NOFOLLOW and holds the directory descriptor,
+# insists on root-owned, non-world-writable directories, writes to an
+# O_EXCL temp file in that directory, re-reads and verifies through the same
+# descriptor, renames atomically, verifies again, and refuses if the existing
+# entry is a symlink or anything but a regular file.
 # ---------------------------------------------------------------------------
 udev_path=/etc/udev/rules.d/70-magic-mouse.rules
 modprobe_path=/etc/modprobe.d/hid_magicmouse.conf
-udev_rules=$(cat <<'RULES'
-# omarchy-magic-mouse: grant the logged-in user access to the Magic Mouse and to
+root_helper=$(cat <<'PY'
+import hashlib, os, stat, subprocess, sys
+
+UDEV = b"""# omarchy-magic-mouse: grant the logged-in user access to the Magic Mouse and to
 # uinput (for the virtual mouse) via logind's per-seat uaccess ACL. No group
 # changes, no world-readable nodes; only these device IDs.
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
@@ -50,31 +60,127 @@ SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="05ac", ATTRS{id/product
 # Raw HID node too, so the daemon can ask the mouse for its battery level.
 SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0269.*", TAG+="uaccess"
 SUBSYSTEM=="hidraw", KERNELS=="0005:05AC:030D.*", TAG+="uaccess"
-RULES
-)
-modprobe_conf=$(cat <<'CONF'
-# omarchy-magic-mouse: let the mouse's own firmware decide left vs right click
+"""
+MODPROBE = b"""# omarchy-magic-mouse: let the mouse's own firmware decide left vs right click
 # (like macOS) instead of the driver's three fixed touch zones, which also
 # invent a middle button that macOS never had.
 options hid_magicmouse emulate_3button=0
-CONF
+"""
+TARGETS = (
+    (("etc", "udev", "rules.d"), "70-magic-mouse.rules", UDEV),
+    (("etc", "modprobe.d"), "hid_magicmouse.conf", MODPROBE),
+)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def die(msg):
+    sys.stderr.write("root helper: " + msg + "\n")
+    sys.exit(1)
+
+
+def open_dir(parts):
+    """Walk from / one component at a time, never following symlinks, and
+    return a descriptor for the final directory. Every component must be a
+    root-owned directory that only root can write to."""
+    fd = os.open("/", DIR_FLAGS)
+    path = ""
+    for part in parts:
+        path += "/" + part
+        try:
+            nfd = os.open(part, DIR_FLAGS, dir_fd=fd)
+        except OSError as e:
+            die("cannot open directory %s: %s" % (path, e.strerror))
+        os.close(fd)
+        fd = nfd
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            die("%s is not a directory" % path)
+        if st.st_uid != 0:
+            die("%s is not owned by root" % path)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            die("%s is writable by non-root users" % path)
+    return fd
+
+
+def install(parts, name, data):
+    path = "/" + "/".join(parts) + "/" + name
+    dfd = open_dir(parts)
+    try:
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            die("%s exists and is not a regular file; refusing to replace it" % path)
+    tmp = ".%s.tmp.%d" % (name, os.getpid())
+    try:
+        tfd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    except OSError as e:
+        die("cannot create %s/%s: %s" % (os.path.dirname(path), tmp, e.strerror))
+    try:
+        view = memoryview(data)
+        while view:
+            n = os.write(tfd, view)
+            view = view[n:]
+        os.fsync(tfd)
+        st = os.fstat(tfd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size != len(data):
+            die("%s: temporary file changed under us" % path)
+        if os.pread(tfd, len(data) + 1, 0) != data:
+            die("%s: temporary file content does not match" % path)
+        os.fchown(tfd, 0, 0)
+        os.fchmod(tfd, 0o644)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(tfd)
+    os.fsync(dfd)
+    ffd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+    try:
+        st = os.fstat(ffd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_nlink != 1:
+            die("%s: not a root-owned regular file after install" % path)
+        if os.pread(ffd, len(data) + 1, 0) != data:
+            die("%s: content mismatch after install" % path)
+    finally:
+        os.close(ffd)
+        os.close(dfd)
+    return hashlib.sha256(data).hexdigest()
+
+
+if os.geteuid() != 0:
+    die("must run as root (install.sh runs it via sudo)")
+os.umask(0o022)
+digests = [install(*t) for t in TARGETS]
+try:
+    pfd = os.open("/sys/module/hid_magicmouse/parameters/emulate_3button", os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+except FileNotFoundError:
+    pass  # driver not loaded yet; the modprobe option applies when it loads
+else:
+    os.write(pfd, b"0\n")
+    os.close(pfd)
+try:
+    os.lstat("/dev/uinput")
+except FileNotFoundError:
+    subprocess.run(["/usr/bin/modprobe", "uinput"], check=True)
+subprocess.run(["/usr/bin/udevadm", "control", "--reload"], check=True)
+subprocess.run(["/usr/bin/udevadm", "trigger", "--subsystem-match=misc", "--subsystem-match=input",
+                "--subsystem-match=hidraw", "--action=add"], check=False)
+print(" ".join(digests))
+PY
 )
 
 [ -t 0 ] || die "the root step uses sudo and needs a terminal: run ./install.sh from an interactive shell inside your desktop session"
-for p in "$udev_path" "$modprobe_path"; do
-  [ -L "$p" ] && die "$p is a symlink; refusing to write through it"
-done
-say "root step (needs your password): tee -> $udev_path, $modprobe_path; udevadm reload"
-printf '%s\n' "$udev_rules"    | sudo tee "$udev_path" >/dev/null
-printf '%s\n' "$modprobe_conf" | sudo tee "$modprobe_path" >/dev/null
-cmp -s <(printf '%s\n' "$udev_rules")    "$udev_path"     || die "$udev_path does not match the rules embedded in install.sh"
-cmp -s <(printf '%s\n' "$modprobe_conf") "$modprobe_path" || die "$modprobe_path does not match the text embedded in install.sh"
-[ -e /dev/uinput ] || sudo modprobe uinput
-sudo udevadm control --reload
-sudo udevadm trigger --subsystem-match=misc --subsystem-match=input --subsystem-match=hidraw --action=add || true  # the ACL check below is the real gate
-if [ -e /sys/module/hid_magicmouse/parameters/emulate_3button ]; then
-  echo 0 | sudo tee /sys/module/hid_magicmouse/parameters/emulate_3button >/dev/null
-fi
+say "root step (needs your password): the helper embedded in install.sh writes $udev_path and $modprobe_path atomically, then reloads udev"
+digests="$(sudo /usr/bin/python3 -I -c "$root_helper")"
+read -r udev_sha modprobe_sha <<<"$digests"
+[ "$(sha256sum "$udev_path" | cut -d' ' -f1)" = "$udev_sha" ]         || die "$udev_path does not match what the helper wrote"
+[ "$(sha256sum "$modprobe_path" | cut -d' ' -f1)" = "$modprobe_sha" ] || die "$modprobe_path does not match what the helper wrote"
 
 # Fail closed: the uaccess ACL must actually have reached the device nodes.
 acl_help="uaccess ACLs are granted by systemd-logind to the active seat session. Run install.sh from a terminal inside your Hyprland session (not over SSH), and check: getfacl /dev/uinput"

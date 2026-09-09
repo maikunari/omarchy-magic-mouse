@@ -139,16 +139,22 @@ Everything is listed so you can decide before running it:
 | `~/.config/systemd/user/magic-mouse.service` | user service, enabled and started |
 | `~/.config/magic-mouse/config.toml` | your settings (only created if missing) |
 | `~/.config/hypr/input.lua` (or `input.conf`) | a 7-line device block, **appended only after asking**, with a backup |
-| `/etc/udev/rules.d/70-magic-mouse.rules` | via `sudo tee`: a `uaccess` rule for the mouse's input and raw HID nodes and for `/dev/uinput`, matched by device ID |
-| `/etc/modprobe.d/hid_magicmouse.conf` | via `sudo tee`: `emulate_3button=0` |
+| `/etc/udev/rules.d/70-magic-mouse.rules` | via the root helper: a `uaccess` rule for the mouse's input and raw HID nodes and for `/dev/uinput`, matched by device ID |
+| `/etc/modprobe.d/hid_magicmouse.conf` | via the root helper: `emulate_3button=0` |
 
-Nothing from the checkout runs as root. The exact text of both `/etc` files is
-embedded in `install.sh`; the only privileged commands are the distro's `tee`,
-`udevadm` and (if `/dev/uinput` is missing) `modprobe`, each with fixed
-arguments, and the installer compares what landed against the embedded text
-before continuing. Access to the mouse comes from that device-specific
-`uaccess` rule alone: the installer never changes your group membership, and
-stops if your user still cannot open the device nodes afterwards.
+No file from the checkout runs as root. The only privileged step is a short
+Python helper embedded in `install.sh` and handed to the distro's `python3` on
+the command line, so it is already in memory when `sudo` runs and nothing on
+disk can be swapped in afterwards. It carries the exact bytes of both `/etc`
+files, walks to each directory one component at a time without following
+symlinks, requires root-owned directories that only root can write to, writes
+to an exclusive temporary file there, verifies it through the same descriptor,
+renames it into place atomically and verifies again; it refuses if anything
+in the way is a symlink or not a regular file. It then reloads udev and
+prints the files' SHA-256 digests, which `install.sh` re-checks as your user.
+Access to the mouse comes from that device-specific `uaccess` rule alone: the
+installer never changes your group membership, and stops if your user still
+cannot open the device nodes afterwards.
 
 No sudoers changes, no NOPASSWD, nothing downloaded at install time. The
 daemon runs as your user, talks only to the local mouse and the Hyprland
