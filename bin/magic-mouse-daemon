@@ -1212,6 +1212,17 @@ class Engine:
         self.primary = None
         self.session_open = False
 
+    def flush_lift(self, now: float) -> None:
+        """End a scroll whose lift outlived BRIDGE_MS. touch() only checks the window when
+        the next report arrives, and a still Magic Mouse 2 sends none after the finger
+        leaves, so the momentum (or page swipe) waited until the mouse was moved."""
+        if self.pending_lift is None or now - self.pending_lift < BRIDGE_MS:
+            return
+        lift, self.pending_lift = self.pending_lift, None
+        if self.verbose:
+            log("lift confirmed by timer")
+        self.end_session(lift)
+
     # ---- momentum
     def stop_coast(self, why: str) -> None:
         if self.coasting and self.verbose:
@@ -1263,7 +1274,7 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                     log("battery: no hidraw node found for the mouse")
             hypr.connect(now)
             hypr.sync_binding(bool(eng.cfg["buttons"]["control_click"]), now)
-            timeout = TICK if eng.coasting else 0.25
+            timeout = TICK if eng.coasting or eng.pending_lift is not None else 0.25
             fds = [dev.fd] + ([hypr] if hypr.sock else [])
             r, _, _ = select.select(fds, [], [], timeout)
             now = time.monotonic()
@@ -1280,6 +1291,7 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                         eng.control_click(time.time())
                     elif line.startswith("configreloaded>>"):
                         hypr.resync()  # a reload drops bindings added at runtime
+            eng.flush_lift(time.time())  # event timestamps are CLOCK_REALTIME, like time.time()
             if eng.coasting:
                 eng.tick(time.time())
             if now >= next_cfg_check:
