@@ -227,6 +227,19 @@ elif ask "Append the 7-line 'magic-mouse-omarchy' device block to $hypr_target? 
 else
   say "Skipped. Add the block from $hypr_snippet to your Hyprland input config by hand."
 fi
+# Checked on its own, so installs from before scroll.output get it on the next run.
+if [ -n "$hypr_target" ]; then
+  pad_snippet="${hypr_snippet/hypr-input/hypr-touchpad}"
+  if grep -q "magic-mouse-omarchy-touchpad" "$hypr_target"; then
+    say "Hyprland touchpad block already present in $hypr_target"
+  elif ask "Append the 'magic-mouse-omarchy-touchpad' device block to $hypr_target? (used when scroll.output = \"touchpad\")"; then
+    cp "$hypr_target" "$hypr_target.bak.magic-mouse.$(date +%s)"
+    cat "$pad_snippet" >> "$hypr_target"
+    say "Hyprland touchpad block appended to $hypr_target (backup written beside it)"
+  else
+    say "Skipped. Add the block from $pad_snippet to your Hyprland input config by hand."
+  fi
+fi
 if command -v hyprctl >/dev/null 2>&1 && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
   hyprctl reload >/dev/null || true
   errs="$(hyprctl configerrors 2>/dev/null || true)"

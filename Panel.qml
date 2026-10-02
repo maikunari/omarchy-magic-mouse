@@ -81,6 +81,8 @@ Panel {
   }
 
   // Pending writes are coalesced so a slider drag becomes a handful of writes.
+  // With touchpad output the app does momentum and page swipes, not the daemon.
+  readonly property bool trackpadScroll: root.val("scroll", "output", "wheel") === "touchpad"
   property var pending: ({})
   function set(section, key, value) {
     var next = Object.assign({}, pending)
@@ -130,6 +132,7 @@ Panel {
   // ---- a labelled slider row
   component SliderRow: Column {
     id: row
+    opacity: enabled ? 1 : 0.45
     property string label: ""
     property string valueText: ""
     property real minimum: 0
@@ -165,6 +168,7 @@ Panel {
   // ---- a labelled switch row
   component SwitchRow: Item {
     id: srow
+    opacity: enabled ? 1 : 0.45
     property string label: ""
     property string description: ""
     property bool checked: false
@@ -272,6 +276,12 @@ Panel {
           checked: root.val("scroll", "natural", true) === true
           onToggled: root.set("scroll", "natural", !(root.val("scroll", "natural", true) === true))
         }
+        SwitchRow {
+          label: "Scroll like a trackpad"
+          description: "Apps do their own momentum and page swipes, like macOS"
+          checked: root.val("scroll", "output", "wheel") === "touchpad"
+          onToggled: root.set("scroll", "output", root.val("scroll", "output", "wheel") === "touchpad" ? "wheel" : "touchpad")
+        }
         SliderRow {
           label: "Scroll speed"
           valueText: root.fmt1(root.val("scroll", "speed", 1.0)) + "×"
@@ -291,12 +301,14 @@ Panel {
         PanelSectionHeader { text: "MOMENTUM"; foreground: root.fg; fontFamily: root.fontFam }
         SwitchRow {
           label: "Momentum scrolling"
+          enabled: !root.trackpadScroll
           description: "Flick and lift, the page keeps gliding"
           checked: root.val("momentum", "enabled", true) === true
           onToggled: root.set("momentum", "enabled", !(root.val("momentum", "enabled", true) === true))
         }
         SliderRow {
           label: "Glide length"
+          enabled: !root.trackpadScroll
           valueText: root.val("momentum", "decay", 0.97) >= 0.983 ? "long (macOS)" : (root.val("momentum", "decay", 0.97) <= 0.955 ? "short" : "medium")
           minimum: 0.94; maximum: 0.99; step: 0.005
           value: root.val("momentum", "decay", 0.97)
@@ -307,6 +319,7 @@ Panel {
         PanelSectionHeader { text: "GESTURES"; foreground: root.fg; fontFamily: root.fontFam }
         SwitchRow {
           label: "Swipe between pages"
+          enabled: !root.trackpadScroll
           description: "One-finger sideways flick = back / forward"
           checked: root.val("gestures", "swipe_pages", true) === true
           onToggled: root.set("gestures", "swipe_pages", !(root.val("gestures", "swipe_pages", true) === true))

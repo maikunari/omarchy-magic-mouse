@@ -37,9 +37,10 @@ import time
 import tomllib
 import errno, secrets, stat
 
-from evdev import InputDevice, UInput, ecodes as e
+from evdev import AbsInfo, InputDevice, UInput, ecodes as e
 
 VIRT_NAME = "magic-mouse-omarchy"
+PAD_NAME = VIRT_NAME + "-touchpad"
 APPLE_VENDORS = {0x004C, 0x05AC}
 MAGIC_MOUSE_PRODUCTS = {0x030D, 0x0269, 0x0323}  # Magic Mouse 1, Magic Mouse 2, Magic Mouse USB-C
 CONFIG_PATH = os.path.expanduser(
@@ -76,6 +77,31 @@ CLICK_QUIET = 0.25  # seconds around a press or release in which no scroll start
 # (MOUSE2 size 8) lists none. A 1–2 report tracking-id flicker or TOUCH_STATE_NONE
 # then looks like a lift unless we expire unmentioned slots and bridge a brief gap.
 BRIDGE_MS = 0.06
+# scroll.output = "touchpad": scrolls are replayed as two-finger scrolls on a virtual
+# touchpad, so apps receive touchpad scrolling (finger source, a stop at lift) and do
+# their own momentum and page swipes, like on macOS. The pad is big enough that one
+# stroke never reaches its edge. The fingers move 1:1 with the (ramped) scroll, so
+# libinput starts a scroll when a touchpad would; the pad's Hyprland scroll_factor
+# matches the speed to the wheel output.
+PAD_RES = 40  # units per mm
+PAD_SIZE_MM = 400.0
+PAD_GAP_MM = 6.0  # each virtual finger sits this far from the centre line
+# libinput discards touchpad motion that looks like a jump, judged per 12 ms. Mouse reports
+# arrive in Bluetooth bursts, so pad frames are paced instead of written per report.
+PAD_FRAME_S = 0.008
+# libinput's rule: a step (normalized to 12 ms) over 20 mm, or 7 mm longer than the
+# previous one, is a jump; the previous step is forgotten after a 25 ms gap. A fast
+# flick's ramp exceeds that, so the fingers' steps are capped (with margin) and the
+# rest carries over to the next frame.
+PAD_STEP_MAX_MM = 18.0
+PAD_STEP_GROWTH_MM = 6.0
+# The daemon has already decided this is a scroll when the fingers land; this much extra
+# travel on the first move lets libinput decide too, instead of waiting out a hold gesture.
+PAD_PREROLL_MM = 2.0
+# Sideways scrolls travel this much farther on the pad. Page swipes complete at a share of
+# the display width (Chrome: 30%), which the mouse's narrow surface cannot reach at the
+# vertical scroll speed.
+PAD_SIDEWAYS_GAIN = 3.5
 
 
 def EVIOCGMTSLOTS(length: int) -> int:
@@ -121,6 +147,7 @@ DEFAULTS = {
         "settle_counts": 4.0,  # ...by more than this many raw counts (then a scroll needs POINTER_RATIO more slide)
         "accel": 0.6,  # 0 = linear, 1 = strong ramp with finger speed
         "horizontal": True,
+        "output": "wheel",  # "touchpad": apps get touchpad scrolling and do momentum and page swipes themselves
     },
     "buttons": {
         "middle": "left",  # a click in the centre zone: "left" (macOS has no middle click), "middle", or "right"
@@ -328,6 +355,21 @@ def make_uinput() -> UInput:
         ],
     }
     return UInput(cap, name=VIRT_NAME, vendor=0x004C, product=0x0269, version=1)
+
+
+def make_touchpad() -> UInput:
+    axis = AbsInfo(0, 0, int(PAD_SIZE_MM * PAD_RES), 0, 0, PAD_RES)
+    cap = {
+        # BTN_RIGHT: without it libinput assumes a clickpad (soft buttons, thumb areas)
+        e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
+        e.EV_ABS: [
+            (e.ABS_X, axis), (e.ABS_Y, axis),
+            (e.ABS_MT_SLOT, AbsInfo(0, 0, 1, 0, 0, 0)),
+            (e.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
+            (e.ABS_MT_POSITION_X, axis), (e.ABS_MT_POSITION_Y, axis),
+        ],
+    }
+    return UInput(cap, name=PAD_NAME, input_props=[e.INPUT_PROP_POINTER])
 
 
 # --------------------------------------------------------------------------- macOS curve
@@ -621,7 +663,18 @@ class Engine:
         self.ui = ui
         self.verbose = verbose
         self.record = None  # --record: raw input events, one "ts type code value" line each
-        self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
+        # scroll.output = "touchpad": the virtual touchpad and its two fingers
+        self.pad: UInput | None = None
+        self.pad_down = False
+        self.pad_xy = [0.0, 0.0]  # where the two virtual fingers are headed (their centre), in mm
+        self.pad_out = [0.0, 0.0]  # where they were last written
+        self.pad_step = 0.0  # last written step, mm per 12 ms (see PAD_STEP_GROWTH_MM)
+        self.pad_tid = 0
+        self.pad_dirty = False  # the fingers are behind pad_xy
+        self.pad_lifting = False  # scroll ended: lift once the fingers caught up
+        self.pad_rolled = False  # PAD_PREROLL_MM applied for this scroll
+        self.pad_last_t = 0.0  # time.monotonic() of the last pad frame
+        self.update_config(cfg)
         self.res_x = TOUCH_UNITS_PER_MM
         self.res_y = TOUCH_UNITS_PER_MM
         self.dev: InputDevice | None = None
@@ -707,6 +760,7 @@ class Engine:
         self.two_key = None
         self.two_ref = None
         self.stop_coast("reset")
+        self.pad_lift(force=True)
 
     def sync_mt(self) -> None:
         """Load the kernel's current multitouch state. Events only carry changes, so
@@ -735,6 +789,8 @@ class Engine:
     def update_config(self, cfg: dict) -> None:
         self.cfg = cfg
         self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
+        if cfg["scroll"]["output"] == "touchpad" and self.pad is None:
+            self.pad = make_touchpad()  # ahead of the first scroll, so the compositor already has it
 
     # ---- helpers
     def pointer_gain(self, v: float) -> float:
@@ -939,6 +995,90 @@ class Engine:
         self.pressed.clear()
         self.right_latched = False
 
+    # ---- touchpad scroll output
+    def pad_touch(self) -> None:
+        """Put two fingers down in the middle of the virtual touchpad."""
+        self.pad_lift(force=True)  # a previous scroll may still be catching up
+        self.pad_xy = [PAD_SIZE_MM / 2, PAD_SIZE_MM / 2]
+        self.pad_out = list(self.pad_xy)
+        self.pad_step = 0.0
+        self.pad_tid = (self.pad_tid + 2) % 65534
+        self.pad_down = True
+        self.pad_rolled = False
+        self.pad_frame(landing=True)
+        self.pad_last_t = time.monotonic()
+        self.pad_dirty = False
+
+    def pad_frame(self, landing: bool = False) -> None:
+        x, y = self.pad_out
+        for slot, off in ((0, -PAD_GAP_MM), (1, PAD_GAP_MM)):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            if landing:
+                self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.pad_tid + slot)
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_X, round((x + off) * PAD_RES))
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_Y, round(y * PAD_RES))
+        if landing:
+            self.pad.write(e.EV_KEY, e.BTN_TOUCH, 1)
+            self.pad.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
+        self.pad.write(e.EV_ABS, e.ABS_X, round((x - PAD_GAP_MM) * PAD_RES))
+        self.pad.write(e.EV_ABS, e.ABS_Y, round(y * PAD_RES))
+        self.pad.syn()
+
+    def pad_scroll(self, amount: float, axis: str) -> None:
+        """Slide the fingers. `amount` has the wheel output's sign: positive = scroll up / right.
+        libinput (natural scrolling off for the pad) scrolls down when the fingers move down."""
+        mm = amount * (PAD_SIDEWAYS_GAIN if axis == "x" else 1.0)
+        if mm and not self.pad_rolled:
+            mm += math.copysign(PAD_PREROLL_MM, mm)
+            self.pad_rolled = True
+        i = 1 if axis == "y" else 0
+        pos = self.pad_xy[i] + (-mm if axis == "y" else mm)
+        self.pad_xy[i] = min(max(pos, 2 * PAD_GAP_MM), PAD_SIZE_MM - 2 * PAD_GAP_MM)
+        self.pad_dirty = True
+
+    def pad_flush(self, now: float) -> None:
+        """Move the fingers toward pad_xy if PAD_FRAME_S passed since the last frame,
+        by no more than libinput accepts as one step."""
+        dt = now - self.pad_last_t
+        if not (self.pad_dirty and self.pad_down) or dt < PAD_FRAME_S:
+            return
+        dx, dy = self.pad_xy[0] - self.pad_out[0], self.pad_xy[1] - self.pad_out[1]
+        step = math.hypot(dx, dy) * 0.012 / dt
+        if dt > 0.025:
+            self.pad_step = 0.0  # libinput does not check across the gap, and forgets
+            k = 1.0
+        else:
+            limit = min(PAD_STEP_MAX_MM, self.pad_step + PAD_STEP_GROWTH_MM)
+            k = 1.0 if step <= limit else limit / step
+        self.pad_out = [self.pad_out[0] + dx * k, self.pad_out[1] + dy * k]
+        self.pad_step = step * k if dt <= 0.025 else 0.0
+        self.pad_dirty = k < 1.0
+        self.pad_frame()
+        self.pad_last_t = now
+        if self.pad_lifting and not self.pad_dirty:
+            self.pad_lift()
+
+    def pad_lift(self, force: bool = False) -> None:
+        """Lift the fingers once they caught up with pad_xy, so a fast flick keeps its
+        distance and its speed at release (the app's fling starts from that); `force` lifts now."""
+        if not self.pad_down:
+            return
+        self.pad_flush(time.monotonic())
+        if not self.pad_down:
+            return  # that flush was the last step and already lifted
+        if self.pad_dirty and not force:
+            self.pad_lifting = True  # pad_flush lifts after the last step
+            return
+        self.pad_dirty = False
+        self.pad_lifting = False
+        for slot in (0, 1):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.pad.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        self.pad.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
+        self.pad.syn()
+        self.pad_down = False
+
     def nav(self, back: bool) -> None:
         code = e.BTN_SIDE if back else e.BTN_EXTRA
         self.ui.write(e.EV_KEY, code, 1)
@@ -1116,6 +1256,8 @@ class Engine:
             self.s_rem = 0.0
             self.s_notch = 0
             self.s_last_t = ts
+            if self.cfg["scroll"]["output"] == "touchpad":
+                self.pad_touch()
             if self.verbose:
                 log(f"scroll start axis={self.axis} fingers={len(key)}")
             return
@@ -1127,6 +1269,7 @@ class Engine:
             # the mouse moves farther than the finger slides: this is mousing now, not
             # scrolling (a resting finger wiggles as the hand pushes). Stop, no glide.
             self.scrolling = False
+            self.pad_lift()
             if self.verbose:
                 log("scroll stop (pointer moving)")
             return
@@ -1143,8 +1286,12 @@ class Engine:
         self.s_speed += k_speed * ((abs(d_mm) / dt if dt > 0 else 0.0) - self.s_speed)
         ramp = 1.0 + float(s["accel"]) * min(max((self.s_speed - 75.0) / 370.0, 0.0), 2.0)
         sign = self.scroll_sign(self.axis)
-        hires = sign * d_mm * HIRES_PER_MM * float(s["speed"]) * ramp
-        self.emit_scroll(hires, self.axis)
+        amount = sign * d_mm * float(s["speed"]) * ramp
+        hires = amount * HIRES_PER_MM
+        if self.pad_down:
+            self.pad_scroll(amount, self.axis)
+        else:
+            self.emit_scroll(hires, self.axis)
         self.s_vel += k_vel * ((hires / dt if dt > 0 else 0.0) - self.s_vel)
 
     def scroll_sign(self, axis: str) -> float:
@@ -1176,7 +1323,9 @@ class Engine:
             self.axis == "x" and g["swipe_pages"]
             and (ts - self.scroll_t0) < 0.4 and abs(self.s_travel) >= float(g["swipe_mm"])
         )
-        if swipe:
+        if self.pad_down:
+            self.pad_lift()  # the app sees the lift: its own momentum and page swipes take over
+        elif swipe:
             self.nav(back=self.s_travel > 0)  # finger moving right = back, like macOS
         elif m["enabled"] and abs(self.s_vel) >= float(m["flick"]):
             self.coasting = True
@@ -1211,6 +1360,17 @@ class Engine:
         self.t_ref = None
         self.primary = None
         self.session_open = False
+
+    def flush_lift(self, now: float) -> None:
+        """End a scroll whose lift outlived BRIDGE_MS. touch() only checks the window when
+        the next report arrives, and a still Magic Mouse 2 sends none after the finger
+        leaves, so the momentum (or page swipe) waited until the mouse was moved."""
+        if self.pending_lift is None or now - self.pending_lift < BRIDGE_MS:
+            return
+        lift, self.pending_lift = self.pending_lift, None
+        if self.verbose:
+            log("lift confirmed by timer")
+        self.end_session(lift)
 
     # ---- momentum
     def stop_coast(self, why: str) -> None:
@@ -1263,7 +1423,9 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                     log("battery: no hidraw node found for the mouse")
             hypr.connect(now)
             hypr.sync_binding(bool(eng.cfg["buttons"]["control_click"]), now)
-            timeout = TICK if eng.coasting else 0.25
+            timeout = TICK if eng.coasting or eng.pending_lift is not None else 0.25
+            if eng.pad_dirty:
+                timeout = min(timeout, max(eng.pad_last_t + PAD_FRAME_S - time.monotonic(), 0.0))
             fds = [dev.fd] + ([hypr] if hypr.sock else [])
             r, _, _ = select.select(fds, [], [], timeout)
             now = time.monotonic()
@@ -1280,6 +1442,8 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                         eng.control_click(time.time())
                     elif line.startswith("configreloaded>>"):
                         hypr.resync()  # a reload drops bindings added at runtime
+            eng.flush_lift(time.time())  # event timestamps are CLOCK_REALTIME, like time.time()
+            eng.pad_flush(time.monotonic())
             if eng.coasting:
                 eng.tick(time.time())
             if now >= next_cfg_check:
@@ -1307,6 +1471,7 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true", help="log scroll starts and momentum")
     ap.add_argument("--list", action="store_true", help="show detected Magic Mouse and exit")
     ap.add_argument("--record", metavar="PATH", help="append the mouse's raw input events to PATH (for debugging)")
+    ap.add_argument("--device", metavar="PATH", help="use this evdev node instead of the first Magic Mouse found")
     args = ap.parse_args()
 
     if args.list:
@@ -1331,7 +1496,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while True:
-            dev = find_mouse()
+            dev = InputDevice(args.device) if args.device and os.path.exists(args.device) else None
+            if not args.device:
+                dev = find_mouse()
             if dev is None:
                 time.sleep(RESCAN_SEC)
                 continue
@@ -1345,6 +1512,8 @@ def main() -> int:
             hypr.sync_binding(False, time.monotonic())
         hypr.close()
         ui.close()
+        if eng.pad:
+            eng.pad.close()
     return 0
 
 

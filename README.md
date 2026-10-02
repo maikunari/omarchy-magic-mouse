@@ -44,6 +44,13 @@ A small daemon grabs the real mouse and re-emits a virtual one called
   the daemon never reads the keyboard, so it adds a Hyprland binding for
   Control + click on its virtual mouse only and answers it with a right click.
   While it is on, apps no longer see Control + click from the Magic Mouse.
+- **Trackpad-style scrolling (optional):** with `scroll.output = "touchpad"`
+  ("Scroll like a trackpad" in the popup) scrolls reach apps through a second
+  virtual device, a touchpad, as two-finger scrolls. Apps then get touchpad
+  scrolling with a stop at lift, and do what they do on a Mac: their own
+  momentum, and page swipes that follow the finger. In Chrome that is the
+  back / forward arrow that tracks the swipe and navigates when you let go.
+  The daemon's own momentum and flick back / forward are off in this mode.
 - **Gestures:** one-finger sideways flick = back / forward (browser buttons).
   Two-finger sideways swipe = previous / next workspace. One- and two-finger
   double taps are hooks you can point at any Hyprland dispatcher or command.
@@ -73,7 +80,7 @@ Hyprland only needs a flat profile for the virtual device; the installer adds it
 | Secondary click off | `buttons.right_click = false` (switch in the popup) |
 | Control-click = secondary click | `buttons.control_click = true` (switch in the popup) |
 | No middle click | `buttons.middle = "left"` |
-| Swipe between pages (one finger) | back / forward buttons |
+| Swipe between pages (one finger) | back / forward buttons; with `scroll.output = "touchpad"` the app's own swipe (Chrome's arrow) |
 | Swipe between full-screen apps (two fingers) | workspace switch (`hl.dsp.focus({ workspace = "e+1" })`) |
 | Mission Control (two-finger double tap) | hook, off by default |
 | Smart zoom (one-finger double tap) | hook, off by default |
@@ -128,6 +135,7 @@ effective config as JSON.
 | forward/back inverted only on my model | flip `scroll.invert_y` |
 | glide too long / too short | `momentum.decay` 0.95 / 0.985 |
 | no glide | `momentum.enabled = false` |
+| page swipes and glide should feel like the app on a Mac | `scroll.output = "touchpad"` |
 
 ## Remove
 
@@ -137,7 +145,7 @@ omarchy plugin remove io.github.maikunari.magic-mouse                     # the 
 ```
 
 `uninstall.sh` leaves `~/.config/magic-mouse/config.toml` and the small
-`magic-mouse-omarchy` device block in your Hyprland input config; delete those
+`magic-mouse-omarchy` device blocks in your Hyprland input config; delete those
 by hand if you want a clean slate.
 
 ## What the installer touches
@@ -149,7 +157,7 @@ Everything is listed so you can decide before running it:
 | `~/.local/bin/magic-mouse-daemon`, `magic-mouse-config`, `magic-mouse-battery-query` | the daemon and its two helpers |
 | `~/.config/systemd/user/magic-mouse.service` | user service, enabled and started |
 | `~/.config/magic-mouse/config.toml` | your settings (only created if missing) |
-| `~/.config/hypr/input.lua` (or `input.conf`) | a 7-line device block, **appended only after asking**, with a backup |
+| `~/.config/hypr/input.lua` (or `input.conf`) | two device blocks (`magic-mouse-omarchy`, `magic-mouse-omarchy-touchpad`), each **appended only after asking**, with a backup |
 | `/etc/udev/rules.d/70-magic-mouse.rules` | via the root helper: a `uaccess` rule for the mouse's input and raw HID nodes and for `/dev/uinput`, matched by device ID |
 | `/etc/modprobe.d/hid_magicmouse.conf` | via the root helper: `emulate_3button=0` |
 | `/etc/modules-load.d/magic-mouse.conf` | via the root helper: loads `uinput` at boot so the rule above can apply |
