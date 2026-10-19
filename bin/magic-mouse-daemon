@@ -120,6 +120,7 @@ DEFAULTS = {
         "settle_ms": 150.0,  # the mouse counts as moving if it moved within this long...
         "settle_counts": 4.0,  # ...by more than this many raw counts (then a scroll needs POINTER_RATIO more slide)
         "accel": 0.6,  # 0 = linear, 1 = strong ramp with finger speed
+        "max_scroll_speed": 400.0,  # mm/s ceiling on emitted scroll; clips rocket flings, leaves normal scroll alone
         "horizontal": True,
     },
     "buttons": {
@@ -649,6 +650,13 @@ class Engine:
         self.cur_slot = 0
         self.mt_frame = False  # this SYN_REPORT included ABS_MT_* (a HID touch report)
         self.mt_seen: set[int] = set()  # slots mentioned in this touch report
+        # Device-clock frame timing (MSC_TIMESTAMP from a patched hid-magicmouse).
+        # Bluetooth delivers reports in bursts; the device's 1 kHz clock gives the
+        # true sampling times, so velocities stay correct through a burst.
+        self.hw_ts_raw = 0
+        self.hw_frame_has_ts = False
+        self.hw_last_raw: int | None = None
+        self.hw_synth = 0.0
         self.pending_lift: float | None = None  # apparent lift; end scroll if nothing returns within BRIDGE_MS
         self.touches: dict[int, Touch] = {}  # tracking_id -> Touch
         self.primary: tuple[int, ...] | None = None  # the finger (or two) being followed
@@ -683,6 +691,7 @@ class Engine:
     # ---- device attach
     def attach(self, dev: InputDevice) -> None:
         self.dev = dev
+        self.hw_last_raw = None
         self.reset_touch()
         self.v = 0.0
         self.last_motion_t = -1.0
@@ -766,18 +775,44 @@ class Engine:
             self.s_notch -= step * HIRES
 
     # ---- event intake
+    def hw_time(self, wall: float) -> float:
+        """A frame timestamp advanced by the device clock, clamped to wall time.
+        During a Bluetooth burst the frames arrive almost at once, but their
+        device-clock spacing is the true ~11 ms cadence."""
+        raw = self.hw_ts_raw
+        if self.hw_last_raw is None:
+            self.hw_synth = wall
+        else:
+            d = ((raw - self.hw_last_raw) & 0xFFFFFFFF) / 1e6
+            if d > 1.0 or wall - (self.hw_synth + d) > 0.5:
+                self.hw_synth = wall  # reconnect or long gap: re-anchor
+            else:
+                self.hw_synth = min(self.hw_synth + d, wall)
+        self.hw_last_raw = raw
+        return self.hw_synth
+
     def feed(self, ev) -> None:
         if self.record:
             self.record.write(f"{ev.timestamp():.6f} {ev.type} {ev.code} {ev.value}\n")
+        if ev.type == e.EV_MSC:
+            if ev.code == e.MSC_TIMESTAMP:
+                self.hw_ts_raw = ev.value & 0xFFFFFFFF
+                self.hw_frame_has_ts = True
+            return
         if ev.type == e.EV_SYN:
             if ev.code == e.SYN_DROPPED:
                 self.dropped = True  # the kernel's buffer overflowed; state is unknown
+                self.hw_last_raw = None
                 log("SYN_DROPPED")
             elif ev.code == e.SYN_REPORT:
+                ts = ev.timestamp()
+                if self.hw_frame_has_ts:
+                    ts = self.hw_time(ts)
+                    self.hw_frame_has_ts = False
                 if self.dropped:
-                    self.resync(ev.timestamp())
+                    self.resync(ts)
                 else:
-                    self.process_frame(ev.timestamp())
+                    self.process_frame(ts)
             return
         if self.dropped:
             return
@@ -1143,7 +1178,14 @@ class Engine:
         self.s_speed += k_speed * ((abs(d_mm) / dt if dt > 0 else 0.0) - self.s_speed)
         ramp = 1.0 + float(s["accel"]) * min(max((self.s_speed - 75.0) / 370.0, 0.0), 2.0)
         sign = self.scroll_sign(self.axis)
-        hires = sign * d_mm * HIRES_PER_MM * float(s["speed"]) * ramp
+        amount = sign * d_mm * float(s["speed"]) * ramp
+        # A real finger tops out around max_scroll_speed mm/s; the ramp, a firmware
+        # position spike or a resting-finger wiggle after a Bluetooth stall can push the
+        # output past that. Clip the emitted distance (not the raw finger motion, so
+        # normal scrolling is untouched) so the momentum it seeds can never rocket.
+        cap = float(s["max_scroll_speed"]) * max(dt, NOMINAL_DT)
+        amount = max(-cap, min(cap, amount))
+        hires = amount * HIRES_PER_MM
         self.emit_scroll(hires, self.axis)
         self.s_vel += k_vel * ((hires / dt if dt > 0 else 0.0) - self.s_vel)
 
