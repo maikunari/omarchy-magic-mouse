@@ -99,6 +99,9 @@ CATCH_S = 0.12
 # the natural slow-down at the end of a stroke must not cut the glide.
 HOLD_S = 0.25
 MAX_COAST = 15000.0  # hires units/s
+# Moving the mouse this far (mm, within MOVE_WINDOW) stops a glide, so it can't
+# scroll whatever window the pointer moves onto. A hand settling moves less.
+GLIDE_POINTER_MM = 3.0
 
 
 def EVIOCGMTSLOTS(length: int) -> int:
@@ -915,6 +918,10 @@ class Engine:
         keep = max(float(self.cfg["scroll"]["settle_ms"]) / 1000.0, MOVE_WINDOW)
         while self.recent and self.recent[0][0] < ts - keep:
             self.recent.popleft()
+        if self.coasting and not self.scrolling and self.pointer_mm(ts, MOVE_WINDOW) >= GLIDE_POINTER_MM:
+            # wheel events go to the window under the pointer: a glide must not
+            # follow the pointer into another window
+            self.stop_coast("pointer")
         # Smoothed velocity. A burst frame (dt ~ 0) gets ~zero weight, so it
         # cannot spike the estimate the way it does inside libinput.
         if dt > 0:

@@ -214,6 +214,20 @@ class ScrollLiftCase(unittest.TestCase):
             self.report([(0, 3, -600, y)])
         self.assertFalse(self.eng.coasting, "a resting finger holds the page instead of riding the glide")
 
+    def move(self, frames, dx):
+        e = mmd.e
+        for _ in range(frames):
+            self.eng.feed(Ev(self.t, e.EV_REL, e.REL_X, dx))
+            self.eng.feed(Ev(self.t, e.EV_SYN, e.SYN_REPORT, 0))
+            self.t += DT
+
+    def test_moving_the_pointer_stops_a_glide(self):
+        self.glide()
+        self.move(3, 2)  # the hand settles: a fraction of a millimetre
+        self.assertTrue(self.eng.coasting, "a small nudge keeps the glide")
+        self.move(10, 20)  # the pointer heads for another window
+        self.assertFalse(self.eng.coasting, "the glide must not scroll the window the pointer moves onto")
+
     def test_opposite_scroll_stops_a_glide(self):
         self.glide()
         self.stroke(25, y0=-500, dy=40, tid=3)
