@@ -76,6 +76,32 @@ CLICK_QUIET = 0.25  # seconds around a press or release in which no scroll start
 # (MOUSE2 size 8) lists none. A 1–2 report tracking-id flicker or TOUCH_STATE_NONE
 # then looks like a lift unless we expire unmentioned slots and bridge a brief gap.
 BRIDGE_MS = 0.06
+# A tracking-id flicker re-reports the same finger under a new id, at (nearly) the
+# same spot, within a report or two of when it was last seen. Such a touch keeps
+# the old one's state instead of starting over as a new finger.
+REDETECT_S = 0.06
+REDETECT_MM = 8.0
+# Distinct fingers are well apart; a lone finger this far from where the scroll
+# was is a finger that was resting, not the scrolling finger re-reported.
+HANDOFF_MM = 10.0
+# The mouse sends a touch report every ~11 ms while a finger is down and nothing
+# once it lifts (there is no lift event). During a scroll, this much silence is a
+# lift, so momentum starts with the finger's real speed instead of waiting for the
+# next touch report (often the next stroke, hundreds of ms later). A gap this long
+# that turns out not to be a lift is harmless: the finger picks the glide up again.
+LIFT_SILENCE = 0.05
+# A finger that lands on a gliding page and doesn't scroll on with it within this
+# long has caught the page: the glide stops, like macOS. A stroke the same way
+# instead rides on the glide: the page keeps the glide's speed (the finger's, if
+# that is faster) and the glide starts over from that speed at lift.
+CATCH_S = 0.12
+# While riding on a glide, the finger has to hold still this long to stop the page;
+# the natural slow-down at the end of a stroke must not cut the glide.
+HOLD_S = 0.25
+MAX_COAST = 15000.0  # hires units/s
+# Moving the mouse this far (mm, within MOVE_WINDOW) stops a glide, so it can't
+# scroll whatever window the pointer moves onto. A hand settling moves less.
+GLIDE_POINTER_MM = 3.0
 
 
 def EVIOCGMTSLOTS(length: int) -> int:
@@ -651,6 +677,10 @@ class Engine:
         self.mt_seen: set[int] = set()  # slots mentioned in this touch report
         self.pending_lift: float | None = None  # apparent lift; end scroll if nothing returns within BRIDGE_MS
         self.touches: dict[int, Touch] = {}  # tracking_id -> Touch
+        self.vanished: list[tuple[int, Touch]] = []  # (tracking_id, Touch) that just left the report
+        self.last_mt_t = 0.0  # timestamp of the last touch report
+        self.bridged = 0.0  # hires already scrolled on at the finger's speed while a report was late
+        self.b_last_t = 0.0
         self.primary: tuple[int, ...] | None = None  # the finger (or two) being followed
         self.t_ref: tuple[int, int] | None = None
         self.scrolling = False
@@ -679,6 +709,10 @@ class Engine:
         self.c_vel = 0.0
         self.c_t0 = 0.0
         self.c_last_t = 0.0
+        self.c_axis = "y"
+        self.carry = False  # a same-direction stroke is riding on the glide
+        self.catch_t: float | None = None  # when a finger landed on the glide
+        self.hold_t: float | None = None  # since when a riding finger has been still
 
     # ---- device attach
     def attach(self, dev: InputDevice) -> None:
@@ -696,6 +730,7 @@ class Engine:
     def reset_touch(self) -> None:
         self.slots.clear()
         self.touches.clear()
+        self.vanished = []
         self.cur_slot = 0
         self.mt_frame = False
         self.mt_seen.clear()
@@ -827,6 +862,7 @@ class Engine:
     # ---- per-frame processing
     def process_frame(self, ts: float) -> None:
         if self.mt_frame:
+            self.last_mt_t = ts
             # Motion-only packets (no ABS_MT) must not expire slots: those HID
             # reports simply omit touch data. A real touch report is the full set.
             stale = [s for s in self.slots if s not in self.mt_seen or self.slots[s][0] < 0]
@@ -882,6 +918,10 @@ class Engine:
         keep = max(float(self.cfg["scroll"]["settle_ms"]) / 1000.0, MOVE_WINDOW)
         while self.recent and self.recent[0][0] < ts - keep:
             self.recent.popleft()
+        if self.coasting and not self.scrolling and self.pointer_mm(ts, MOVE_WINDOW) >= GLIDE_POINTER_MM:
+            # wheel events go to the window under the pointer: a glide must not
+            # follow the pointer into another window
+            self.stop_coast("pointer")
         # Smoothed velocity. A burst frame (dt ~ 0) gets ~zero weight, so it
         # cannot spike the estimate the way it does inside libinput.
         if dt > 0:
@@ -964,19 +1004,25 @@ class Engine:
     def touch(self, ts: float) -> None:
         live = {v[0]: (v[1], v[2]) for v in self.slots.values() if v[0] >= 0}
         for tid in [t for t in self.touches if t not in live]:
-            del self.touches[tid]
+            self.vanished.append((tid, self.touches.pop(tid)))
+        # only a touch seen within the last report or two can come back as a flicker
+        self.vanished = [v for v in self.vanished if ts - v[1].hist[-1][0] <= REDETECT_S]
         edge = EDGE_MM * self.res_x
         for tid, (x, y) in live.items():
             t = self.touches.get(tid)
+            if t is None and self.redetect(ts, tid, x, y):
+                continue
             if t is None:
                 grip = x <= self.x_min + edge or x >= self.x_max - edge
                 self.touches[tid] = Touch(ts, x, y, grip)
                 if not grip:
-                    self.stop_coast("touch")
+                    self.catch(ts)
             else:
                 t.update(ts, x, y)
 
         fingers = sorted(tid for tid, t in self.touches.items() if not t.grip)
+        if self.catch_t is not None and not self.carry and (not fingers or ts - self.catch_t >= CATCH_S):
+            self.stop_coast("touch")  # a finger rested on (or tapped) the gliding page
         if not fingers:
             # A 1–2 report dropout (TOUCH_STATE_NONE, or the kernel leaving a
             # slot up because it never syncs unused contacts) looks like a lift.
@@ -1002,7 +1048,7 @@ class Engine:
             self.gesture_fired = False
             self.two_key = None
             self.primary = None
-            self.stop_coast("touch")
+            self.catch(ts)
         self.max_fingers = max(self.max_fingers, len(fingers))
         key = self.pick(fingers)
         if key is None:
@@ -1017,6 +1063,32 @@ class Engine:
         y = sum(self.touches[t].y for t in key) / len(key)
         self.follow(ts, key, x, y)
 
+    def redetect(self, ts: float, tid: int, x: int, y: int) -> bool:
+        """A new tracking id where a touch just vanished is that same finger:
+        keep its Touch (grip flag, history) and its place in the scroll/gesture."""
+        best = None
+        for i, (old_tid, old) in enumerate(self.vanished):
+            d = math.hypot((x - old.x) / self.res_x, (y - old.y) / self.res_y)
+            if d <= REDETECT_MM and (best is None or d < best[0]):
+                best = (d, i, old_tid, old)
+        if best is None:
+            return False
+        _, i, old, t = best
+        del self.vanished[i]
+        t.update(ts, x, y)
+        self.touches[tid] = t
+
+        def swap(key: tuple[int, ...] | None) -> tuple[int, ...] | None:
+            if not key or old not in key:
+                return key
+            return tuple(sorted(tid if k == old else k for k in key))
+
+        self.primary = swap(self.primary)
+        self.two_key = swap(self.two_key)
+        if self.verbose:
+            log(f"touch: re-detected {old} -> {tid}")
+        return True
+
     def pick(self, fingers: list[int]) -> tuple[int, ...] | None:
         """The finger(s) to follow: a scroll in progress keeps its own; otherwise the
         one that moves while the others rest, or two moving the same way."""
@@ -1026,7 +1098,11 @@ class Engine:
         if self.scrolling and down(self.primary):
             return self.primary
         if self.scrolling and len(fingers) == 1:
-            return (fingers[0],)  # tracking id changed; keep the remaining finger
+            t = self.touches[fingers[0]]
+            if self.t_ref is None or math.hypot((t.x - self.t_ref[0]) / self.res_x,
+                                                (t.y - self.t_ref[1]) / self.res_y) <= HANDOFF_MM:
+                return (fingers[0],)  # tracking id changed; keep the remaining finger
+            return None  # the scrolling finger lifted; what is left was resting
         if len(fingers) == 1:
             return (fingers[0],)
         moves = sorted(((math.hypot(*self.touches[t].recent()) / self.res_x, t) for t in fingers), reverse=True)
@@ -1106,6 +1182,16 @@ class Engine:
             if self.axis == "x" and (not s["horizontal"] or len(key) == 2):
                 self.t_ref = (x, y)  # sideways with two fingers is the workspace gesture
                 return
+            if self.coasting:
+                d_mm = dy_mm if self.axis == "y" else dx_mm
+                if self.axis == self.c_axis and self.scroll_sign(self.axis) * d_mm * self.c_vel > 0:
+                    self.carry = True  # same way as the glide: ride on it
+                    self.catch_t = None
+                    self.hold_t = None
+                    if self.verbose:
+                        log(f"scroll carries the glide ({self.c_vel:.0f} hires/s)")
+                else:
+                    self.stop_coast("scroll")
             self.scrolling = True
             self.session_scrolled = True
             self.scroll_t0 = ts
@@ -1116,6 +1202,7 @@ class Engine:
             self.s_rem = 0.0
             self.s_notch = 0
             self.s_last_t = ts
+            self.bridged = 0.0
             if self.verbose:
                 log(f"scroll start axis={self.axis} fingers={len(key)}")
             return
@@ -1127,6 +1214,7 @@ class Engine:
             # the mouse moves farther than the finger slides: this is mousing now, not
             # scrolling (a resting finger wiggles as the hand pushes). Stop, no glide.
             self.scrolling = False
+            self.carry = False  # a glide it was riding on just eases out
             if self.verbose:
                 log("scroll stop (pointer moving)")
             return
@@ -1144,8 +1232,36 @@ class Engine:
         ramp = 1.0 + float(s["accel"]) * min(max((self.s_speed - 75.0) / 370.0, 0.0), 2.0)
         sign = self.scroll_sign(self.axis)
         hires = sign * d_mm * HIRES_PER_MM * float(s["speed"]) * ramp
-        self.emit_scroll(hires, self.axis)
         self.s_vel += k_vel * ((hires / dt if dt > 0 else 0.0) - self.s_vel)
+        if self.carry and self.coasting:
+            self.ride(ts, key)
+        if self.carry and self.coasting:
+            return  # the glide moves the page; the stroke only keeps it going
+        if self.bridged:
+            # the report was late and idle() already moved the page on at the
+            # finger's speed: only the part the finger went beyond that is new
+            if hires * self.bridged > 0:
+                take = hires if abs(hires) < abs(self.bridged) else self.bridged
+                hires -= take
+                self.bridged -= take
+            else:
+                self.bridged = 0.0
+        self.emit_scroll(hires, self.axis)
+
+    def ride(self, ts: float, key: tuple[int, ...]) -> None:
+        """A stroke riding on the glide: keep the glide's speed, take the finger's if
+        it is faster, and let the page go only if the finger turns back or holds still."""
+        if self.s_vel * self.c_vel < 0 and abs(self.s_vel) >= float(self.cfg["momentum"]["flick"]):
+            self.stop_coast("reversed")
+            return
+        if self.s_vel * self.c_vel > 0 and abs(self.s_vel) > abs(self.c_vel):
+            self.c_vel = math.copysign(min(abs(self.s_vel), MAX_COAST), self.c_vel)
+        if self.key_recent_mm(key) >= MOVING_MM:
+            self.hold_t = None
+        elif self.hold_t is None:
+            self.hold_t = ts
+        elif ts - self.hold_t >= HOLD_S:
+            self.stop_coast("held")  # the finger rests on the page: it holds it
 
     def scroll_sign(self, axis: str) -> float:
         """Map finger travel (touch units) to wheel sign.
@@ -1178,14 +1294,22 @@ class Engine:
         )
         if swipe:
             self.nav(back=self.s_travel > 0)  # finger moving right = back, like macOS
+        elif self.carry and self.coasting:
+            # the stroke rode on the glide: the glide starts over from the speed it held
+            self.c_t0 = ts
+            if self.verbose:
+                log(f"coast carried on {self.c_vel:.0f} hires/s axis={self.c_axis}")
         elif m["enabled"] and abs(self.s_vel) >= float(m["flick"]):
             self.coasting = True
-            self.c_vel = self.s_vel
+            self.c_vel = math.copysign(min(abs(self.s_vel), MAX_COAST), self.s_vel)
+            self.c_axis = self.axis
             self.c_t0 = ts
             self.c_last_t = ts
             self.s_rem = 0.0
             if self.verbose:
                 log(f"coast start {self.c_vel:.0f} hires/s axis={self.axis}")
+        self.carry = False
+        self.bridged = 0.0
         self.scrolling = False
         self.primary = None
         self.t_ref = None
@@ -1213,16 +1337,55 @@ class Engine:
         self.session_open = False
 
     # ---- momentum
+    def idle(self, now: float) -> None:
+        """Called from the main loop. The mouse sends no lift event, so a lift is a
+        silence. Until the silence is long enough to tell, keep the page moving at
+        the finger's speed, so the hand-over from finger to glide can't be seen."""
+        if not self.scrolling:
+            return
+        m = self.cfg["momentum"]
+        due = self.last_mt_t + NOMINAL_DT  # when the next report should have come
+        swipe_window = self.axis == "x" and self.cfg["gestures"]["swipe_pages"] and now - self.scroll_t0 < 0.4
+        if (not self.coasting and m["enabled"] and not swipe_window
+                and abs(self.s_vel) >= float(m["flick"]) and now > due):
+            start = max(self.b_last_t, due)
+            if now > start:
+                step = self.s_vel * (now - start)
+                self.emit_scroll(step, self.axis)
+                self.ui.syn()
+                self.bridged += step
+                self.b_last_t = now
+        if now - self.last_mt_t >= LIFT_SILENCE:
+            if self.verbose:
+                log(f"scroll lift (silence {1000 * (now - self.last_mt_t):.0f} ms)")
+            bridged = bool(self.bridged)
+            self.end_scroll(self.last_mt_t + NOMINAL_DT)
+            if self.coasting:
+                self.c_t0 = now
+                if bridged:
+                    self.c_last_t = now  # the page is already where the glide would be
+
+    def catch(self, ts: float) -> None:
+        """A finger landed: if the page is gliding, it stops unless the finger scrolls on."""
+        if self.coasting and self.catch_t is None:
+            self.catch_t = ts
+
     def stop_coast(self, why: str) -> None:
         if self.coasting and self.verbose:
             log(f"coast stop ({why})")
         self.coasting = False
         self.c_vel = 0.0
+        self.carry = False
+        self.catch_t = None
+        self.hold_t = None
 
     def tick(self, now: float) -> None:
         if not self.coasting:
             return
         m = self.cfg["momentum"]
+        carried = self.carry and self.scrolling
+        if carried:
+            self.c_t0 = now  # a stroke riding on the glide holds it at full speed
         if now - self.c_t0 > float(m["max_seconds"]) or abs(self.c_vel) < float(m["stop"]):
             self.stop_coast("decay")
             return
@@ -1233,9 +1396,10 @@ class Engine:
         self.c_last_t = now
         if dt == 0.0:
             return
-        self.emit_scroll(self.c_vel * dt, self.axis)
+        self.emit_scroll(self.c_vel * dt, self.c_axis)
         self.ui.syn()
-        self.c_vel *= float(m["decay"]) ** (dt / TICK)
+        if not carried:
+            self.c_vel *= float(m["decay"]) ** (dt / TICK)
 
 
 # --------------------------------------------------------------------------- main loop
@@ -1263,7 +1427,7 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                     log("battery: no hidraw node found for the mouse")
             hypr.connect(now)
             hypr.sync_binding(bool(eng.cfg["buttons"]["control_click"]), now)
-            timeout = TICK if eng.coasting else 0.25
+            timeout = TICK if (eng.coasting or eng.scrolling) else 0.25
             fds = [dev.fd] + ([hypr] if hypr.sock else [])
             r, _, _ = select.select(fds, [], [], timeout)
             now = time.monotonic()
@@ -1280,6 +1444,7 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                         eng.control_click(time.time())
                     elif line.startswith("configreloaded>>"):
                         hypr.resync()  # a reload drops bindings added at runtime
+            eng.idle(time.time())
             if eng.coasting:
                 eng.tick(time.time())
             if now >= next_cfg_check:
